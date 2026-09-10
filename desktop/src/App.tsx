@@ -139,8 +139,8 @@ function App() {
             </div>
           )}
 
-          {resource?.kind === "media_page" && <p className="info-message">Media page detected. Extraction support is the next download-engine layer.</p>}
-          {resource?.kind === "webpage" && <p className="info-message">This is a webpage, not a direct file. Media extraction will be added next.</p>}
+          {resource?.kind === "media_page" && <p className="info-message">Media detected. Monk3i will use the media extraction engine when you add this download.</p>}
+          {resource?.kind === "webpage" && <p className="info-message">This is a webpage, not a direct file. Media extraction can be used for supported media sites.</p>}
           {error && <p className="error-message">{error}</p>}
         </section>
 
