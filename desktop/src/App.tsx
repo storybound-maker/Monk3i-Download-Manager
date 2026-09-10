@@ -18,7 +18,7 @@ type DownloadProgress = {
 
 type ResourceInfo = {
   url: string;
-  kind: "file" | "image" | "video" | "audio" | "webpage";
+  kind: "file" | "image" | "video" | "audio" | "webpage" | "media_page";
   content_type: string | null;
   filename: string | null;
   size: number | null;
@@ -43,6 +43,7 @@ function typeLabel(kind: ResourceInfo["kind"]): string {
     case "video": return "Video";
     case "audio": return "Audio";
     case "webpage": return "Webpage";
+    case "media_page": return "Media page";
     default: return "Direct file";
   }
 }
@@ -56,37 +57,25 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-
     listen<DownloadProgress>("download-progress", (event) => {
       setDownloads((current) => {
         const incoming = event.payload;
         const existingIndex = current.findIndex((download) => download.id === incoming.id);
-
-        if (existingIndex === -1) {
-          return [incoming, ...current];
-        }
-
+        if (existingIndex === -1) return [incoming, ...current];
         const next = [...current];
         next[existingIndex] = incoming;
         return next;
       });
-    }).then((cleanup) => {
-      unlisten = cleanup;
-    });
-
-    return () => {
-      unlisten?.();
-    };
+    }).then((cleanup) => { unlisten = cleanup; });
+    return () => { unlisten?.(); };
   }, []);
 
   const inspectUrl = async () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) return;
-
     setError("");
     setResource(null);
     setInspecting(true);
-
     try {
       const result = await invoke<ResourceInfo>("inspect_url", { url: trimmedUrl });
       setResource(result);
@@ -100,9 +89,7 @@ function App() {
   const addDownload = async () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) return;
-
     setError("");
-
     try {
       await invoke("start_download", { url: trimmedUrl });
       setUrl("");
@@ -112,168 +99,64 @@ function App() {
     }
   };
 
-  const activeDownloads = downloads.filter(
-    (download) => download.status === "downloading" || download.status === "error",
-  );
+  const activeDownloads = downloads.filter((download) => download.status === "downloading" || download.status === "error");
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">M</div>
-          <div>
-            <div className="brand-name">Monk3i</div>
-            <div className="brand-subtitle">Download Manager</div>
-          </div>
+          <div><div className="brand-name">Monk3i</div><div className="brand-subtitle">Download Manager</div></div>
         </div>
-
         <nav className="sidebar-nav" aria-label="Main navigation">
-          <button className="nav-item active" type="button">
-            <span className="nav-icon">↓</span>
-            <span>Downloads</span>
-          </button>
-          <button className="nav-item" type="button">
-            <span className="nav-icon">◷</span>
-            <span>Queue</span>
-          </button>
-          <button className="nav-item" type="button">
-            <span className="nav-icon">✓</span>
-            <span>Completed</span>
-          </button>
-          <button className="nav-item" type="button">
-            <span className="nav-icon">⚙</span>
-            <span>Settings</span>
-          </button>
+          <button className="nav-item active" type="button"><span className="nav-icon">↓</span><span>Downloads</span></button>
+          <button className="nav-item" type="button"><span className="nav-icon">◷</span><span>Queue</span></button>
+          <button className="nav-item" type="button"><span className="nav-icon">✓</span><span>Completed</span></button>
+          <button className="nav-item" type="button"><span className="nav-icon">⚙</span><span>Settings</span></button>
         </nav>
-
-        <div className="sidebar-footer">
-          <span>Monk3i Systems</span>
-          <span>v0.1.0</span>
-        </div>
+        <div className="sidebar-footer"><span>Monk3i Systems</span><span>v0.1.0</span></div>
       </aside>
 
       <main className="main-content">
         <header className="topbar">
-          <div>
-            <p className="eyebrow">MONK3I SYSTEMS</p>
-            <h1>Downloads</h1>
-            <p className="page-description">
-              Manage and monitor your downloads in one place.
-            </p>
-          </div>
-
-          <button className="icon-button" type="button" aria-label="Settings">
-            ⚙
-          </button>
+          <div><p className="eyebrow">MONK3I SYSTEMS</p><h1>Downloads</h1><p className="page-description">Manage and monitor your downloads in one place.</p></div>
+          <button className="icon-button" type="button" aria-label="Settings">⚙</button>
         </header>
 
         <section className="add-card" aria-label="Add download">
-          <div className="add-card-copy">
-            <div className="add-icon">↓</div>
-            <div>
-              <h2>Add a download</h2>
-              <p>Paste a URL and Monk3i will identify what it points to.</p>
-            </div>
-          </div>
-
+          <div className="add-card-copy"><div className="add-icon">↓</div><div><h2>Add a download</h2><p>Paste a URL and Monk3i will identify what it points to.</p></div></div>
           <div className="url-row">
-            <input
-              className="url-input"
-              type="url"
-              value={url}
-              onChange={(event) => {
-                setUrl(event.currentTarget.value);
-                setResource(null);
-                setError("");
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") inspectUrl();
-              }}
-              placeholder="https://example.com/file.zip"
-              aria-label="Download URL"
-            />
-            <button className="secondary-button" type="button" onClick={inspectUrl} disabled={inspecting}>
-              {inspecting ? "Checking..." : "Detect"}
-            </button>
-            <button className="primary-button" type="button" onClick={addDownload}>
-              + Add Download
-            </button>
+            <input className="url-input" type="url" value={url} onChange={(event) => { setUrl(event.currentTarget.value); setResource(null); setError(""); }} onKeyDown={(event) => { if (event.key === "Enter") inspectUrl(); }} placeholder="https://example.com/file.zip" aria-label="Download URL" />
+            <button className="secondary-button" type="button" onClick={inspectUrl} disabled={inspecting}>{inspecting ? "Checking..." : "Detect"}</button>
+            <button className="primary-button" type="button" onClick={addDownload}>+ Add Download</button>
           </div>
 
           {resource && (
             <div className="resource-result">
-              <div>
-                <strong>{typeLabel(resource.kind)}</strong>
-                <span>{resource.filename ?? "No filename detected"}</span>
-              </div>
+              <div><strong>{typeLabel(resource.kind)}</strong><span>{resource.filename ?? "No filename detected"}</span></div>
               {resource.content_type && <span>{resource.content_type}</span>}
-              {resource.size !== null && <span>{formatBytes(resource.size)}</span>}
+              <span>{resource.size !== null ? formatBytes(resource.size) : "Size unknown"}</span>
             </div>
           )}
 
-          {resource?.kind === "webpage" && (
-            <p className="info-message">
-              This is a webpage, not a direct file. Media extraction will be added next.
-            </p>
-          )}
-
+          {resource?.kind === "media_page" && <p className="info-message">Media page detected. Extraction support is the next download-engine layer.</p>}
+          {resource?.kind === "webpage" && <p className="info-message">This is a webpage, not a direct file. Media extraction will be added next.</p>}
           {error && <p className="error-message">{error}</p>}
         </section>
 
         <section className="downloads-panel">
-          <div className="section-heading">
-            <div>
-              <h2>Active Downloads</h2>
-              <p>Downloads currently in progress.</p>
-            </div>
-            <span className="count-badge">{activeDownloads.length}</span>
-          </div>
-
+          <div className="section-heading"><div><h2>Active Downloads</h2><p>Downloads currently in progress.</p></div><span className="count-badge">{activeDownloads.length}</span></div>
           {activeDownloads.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-icon">↓</div>
-              <h3>No active downloads</h3>
-              <p>
-                Your active downloads will appear here once you add a download.
-              </p>
-            </div>
+            <div className="empty-state"><div className="empty-icon">↓</div><h3>No active downloads</h3><p>Your active downloads will appear here once you add a download.</p></div>
           ) : (
             <div className="download-list">
               {activeDownloads.map((download) => {
                 const percent = Math.min(100, Math.max(0, download.percent ?? 0));
-
-                return (
-                  <article className="download-item" key={download.id}>
-                    <div className="download-item-top">
-                      <div className="download-file-info">
-                        <div className="download-file-icon">↓</div>
-                        <div>
-                          <h3>{download.filename}</h3>
-                          <p>
-                            {formatBytes(download.downloaded)}
-                            {download.total !== null && ` / ${formatBytes(download.total)}`}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="download-status">
-                        {download.status === "error" ? "Error" : `${percent.toFixed(0)}%`}
-                      </div>
-                    </div>
-
-                    <div className="progress-track" aria-label="Download progress">
-                      <div className="progress-fill" style={{ width: `${percent}%` }} />
-                    </div>
-
-                    <div className="download-item-bottom">
-                      <span>
-                        {download.status === "error"
-                          ? download.error ?? "Download failed."
-                          : formatSpeed(download.speed)}
-                      </span>
-                      <span>{download.status === "error" ? "" : "Downloading"}</span>
-                    </div>
-                  </article>
-                );
+                return <article className="download-item" key={download.id}>
+                  <div className="download-item-top"><div className="download-file-info"><div className="download-file-icon">↓</div><div><h3>{download.filename}</h3><p>{formatBytes(download.downloaded)}{download.total !== null && ` / ${formatBytes(download.total)}`}</p></div></div><div className="download-status">{download.status === "error" ? "Error" : `${percent.toFixed(0)}%`}</div></div>
+                  <div className="progress-track" aria-label="Download progress"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>
+                  <div className="download-item-bottom"><span>{download.status === "error" ? download.error ?? "Download failed." : formatSpeed(download.speed)}</span><span>{download.status === "error" ? "" : "Downloading"}</span></div>
+                </article>;
               })}
             </div>
           )}
