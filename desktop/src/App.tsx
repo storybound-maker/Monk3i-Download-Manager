@@ -11,7 +11,7 @@ type DownloadProgress = {
   total: number | null;
   percent: number | null;
   speed: number;
-  status: "downloading" | "completed" | "error";
+  status: "downloading" | "paused" | "completed" | "cancelled" | "error";
   path: string | null;
   error: string | null;
 };
@@ -99,7 +99,15 @@ function App() {
     }
   };
 
-  const activeDownloads = downloads.filter((download) => download.status === "downloading" || download.status === "error");
+  const controlDownload = async (id: string, action: "pause_download" | "resume_download" | "cancel_download") => {
+    try {
+      await invoke(action, { id });
+    } catch (controlError) {
+      setError(String(controlError));
+    }
+  };
+
+  const activeDownloads = downloads.filter((download) => download.status === "downloading" || download.status === "paused" || download.status === "error");
 
   return (
     <div className="app-shell">
@@ -152,10 +160,21 @@ function App() {
             <div className="download-list">
               {activeDownloads.map((download) => {
                 const percent = Math.min(100, Math.max(0, download.percent ?? 0));
+                const paused = download.status === "paused";
+                const errored = download.status === "error";
                 return <article className="download-item" key={download.id}>
-                  <div className="download-item-top"><div className="download-file-info"><div className="download-file-icon">↓</div><div><h3>{download.filename}</h3><p>{formatBytes(download.downloaded)}{download.total !== null && ` / ${formatBytes(download.total)}`}</p></div></div><div className="download-status">{download.status === "error" ? "Error" : `${percent.toFixed(0)}%`}</div></div>
+                  <div className="download-item-top">
+                    <div className="download-file-info"><div className="download-file-icon">↓</div><div><h3>{download.filename}</h3><p>{formatBytes(download.downloaded)}{download.total !== null && ` / ${formatBytes(download.total)}`}</p></div></div>
+                    <div className="download-status">{errored ? "Error" : paused ? "Paused" : `${percent.toFixed(0)}%`}</div>
+                  </div>
                   <div className="progress-track" aria-label="Download progress"><div className="progress-fill" style={{ width: `${percent}%` }} /></div>
-                  <div className="download-item-bottom"><span>{download.status === "error" ? download.error ?? "Download failed." : formatSpeed(download.speed)}</span><span>{download.status === "error" ? "" : "Downloading"}</span></div>
+                  <div className="download-item-bottom">
+                    <span>{errored ? download.error ?? "Download failed." : paused ? "Download paused" : formatSpeed(download.speed)}</span>
+                    {!errored && <div className="download-actions">
+                      <button className="download-control" type="button" onClick={() => controlDownload(download.id, paused ? "resume_download" : "pause_download")}>{paused ? "Resume" : "Pause"}</button>
+                      <button className="download-control cancel-control" type="button" onClick={() => controlDownload(download.id, "cancel_download")}>Cancel</button>
+                    </div>}
+                  </div>
                 </article>;
               })}
             </div>
