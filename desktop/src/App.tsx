@@ -16,6 +16,16 @@ type DownloadProgress = {
   error: string | null;
 };
 
+type ResourceInfo = {
+  url: string;
+  kind: "file" | "image" | "video" | "audio" | "webpage";
+  content_type: string | null;
+  filename: string | null;
+  size: number | null;
+  final_url: string;
+  status_code: number;
+};
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -27,10 +37,22 @@ function formatSpeed(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`;
 }
 
+function typeLabel(kind: ResourceInfo["kind"]): string {
+  switch (kind) {
+    case "image": return "Image";
+    case "video": return "Video";
+    case "audio": return "Audio";
+    case "webpage": return "Webpage";
+    default: return "Direct file";
+  }
+}
+
 function App() {
   const [url, setUrl] = useState("");
   const [downloads, setDownloads] = useState<DownloadProgress[]>([]);
   const [error, setError] = useState("");
+  const [resource, setResource] = useState<ResourceInfo | null>(null);
+  const [inspecting, setInspecting] = useState(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -57,6 +79,24 @@ function App() {
     };
   }, []);
 
+  const inspectUrl = async () => {
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
+
+    setError("");
+    setResource(null);
+    setInspecting(true);
+
+    try {
+      const result = await invoke<ResourceInfo>("inspect_url", { url: trimmedUrl });
+      setResource(result);
+    } catch (inspectionError) {
+      setError(String(inspectionError));
+    } finally {
+      setInspecting(false);
+    }
+  };
+
   const addDownload = async () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) return;
@@ -66,6 +106,7 @@ function App() {
     try {
       await invoke("start_download", { url: trimmedUrl });
       setUrl("");
+      setResource(null);
     } catch (downloadError) {
       setError(String(downloadError));
     }
@@ -131,7 +172,7 @@ function App() {
             <div className="add-icon">↓</div>
             <div>
               <h2>Add a download</h2>
-              <p>Paste a direct download link to get started.</p>
+              <p>Paste a URL and Monk3i will identify what it points to.</p>
             </div>
           </div>
 
@@ -140,17 +181,42 @@ function App() {
               className="url-input"
               type="url"
               value={url}
-              onChange={(event) => setUrl(event.currentTarget.value)}
+              onChange={(event) => {
+                setUrl(event.currentTarget.value);
+                setResource(null);
+                setError("");
+              }}
               onKeyDown={(event) => {
-                if (event.key === "Enter") addDownload();
+                if (event.key === "Enter") inspectUrl();
               }}
               placeholder="https://example.com/file.zip"
               aria-label="Download URL"
             />
+            <button className="secondary-button" type="button" onClick={inspectUrl} disabled={inspecting}>
+              {inspecting ? "Checking..." : "Detect"}
+            </button>
             <button className="primary-button" type="button" onClick={addDownload}>
               + Add Download
             </button>
           </div>
+
+          {resource && (
+            <div className="resource-result">
+              <div>
+                <strong>{typeLabel(resource.kind)}</strong>
+                <span>{resource.filename ?? "No filename detected"}</span>
+              </div>
+              {resource.content_type && <span>{resource.content_type}</span>}
+              {resource.size !== null && <span>{formatBytes(resource.size)}</span>}
+            </div>
+          )}
+
+          {resource?.kind === "webpage" && (
+            <p className="info-message">
+              This is a webpage, not a direct file. Media extraction will be added next.
+            </p>
+          )}
+
           {error && <p className="error-message">{error}</p>}
         </section>
 
