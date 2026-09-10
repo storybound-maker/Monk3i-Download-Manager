@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Instant;
 use tauri::Emitter;
 
@@ -29,16 +30,21 @@ struct DownloadProgress {
     error: Option<String>,
 }
 
-fn sanitize_filename(filename: &str) -> String {
-    let cleaned: String = filename
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
+#[derive(Deserialize)]
+struct YtDlpInfo {
+    title: Option<String>,
+    ext: Option<String>,
+    duration: Option<f64>,
+    filesize: Option<u64>,
+    filesize_approx: Option<u64>,
+}
 
+fn sanitize_filename(filename: &str) -> String {
+    let cleaned: String = filename.chars().map(|c| match c {
+        '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+        c if c.is_control() => '_',
+        c => c,
+    }).collect();
     let cleaned = cleaned.trim().trim_matches('.').to_string();
     if cleaned.is_empty() { "download".to_string() } else { cleaned }
 }
@@ -146,15 +152,52 @@ fn filename_from_response(response: &reqwest::Response) -> Option<String> {
     filename_from_url(response.url().as_str())
 }
 
+fn yt_dlp_available() -> bool {
+    Command::new("yt-dlp").arg("--version").output().map(|output| output.status.success()).unwrap_or(false)
+}
+
+fn inspect_media_with_yt_dlp(url: &str) -> Result<YtDlpInfo, String> {
+    if !yt_dlp_available() {
+        return Err("YouTube/media extraction requires yt-dlp. Install yt-dlp, restart Monk3i, and try again.".to_string());
+    }
+    let output = Command::new("yt-dlp")
+        .args(["--dump-single-json", "--no-warnings", "--no-playlist", url])
+        .output()
+        .map_err(|error| format!("Could not start yt-dlp: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() { "yt-dlp could not inspect this media URL.".to_string() } else { message });
+    }
+    serde_json::from_slice::<YtDlpInfo>(&output.stdout).map_err(|error| format!("Could not read media information: {error}"))
+}
+
 #[tauri::command]
 async fn inspect_url(url: String) -> Result<ResourceInfo, String> {
     let url = url.trim().to_string();
     let parsed = reqwest::Url::parse(&url).map_err(|_| "Please enter a valid URL.".to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" { return Err("Only HTTP and HTTPS URLs are supported.".to_string()); }
+
+    if is_known_media_page(&parsed) {
+        let info = inspect_media_with_yt_dlp(&url)?;
+        let filename = info.title.map(|title| sanitize_filename(&title)).map(|title| {
+            let ext = info.ext.clone().unwrap_or_else(|| "mp4".to_string());
+            format!("{title}.{ext}")
+        });
+        return Ok(ResourceInfo {
+            url: url.clone(),
+            kind: "media_page".to_string(),
+            content_type: None,
+            filename,
+            size: info.filesize.or(info.filesize_approx),
+            final_url: url,
+            status_code: 200,
+        });
+    }
+
     let client = reqwest::Client::builder().user_agent("Monk3i Download Manager/0.1").redirect(reqwest::redirect::Policy::limited(10)).build().map_err(|error| error.to_string())?;
-    let response = client.head(parsed.clone()).send().await.map_err(|error| error.to_string())?;
-    let response = if response.status().is_success() || response.status().is_redirection() { response } else {
-        client.get(parsed).header(reqwest::header::RANGE, "bytes=0-0").send().await.map_err(|error| error.to_string())?
+    let response = match client.head(parsed.clone()).send().await {
+        Ok(response) if response.status().is_success() || response.status().is_redirection() => response,
+        _ => client.get(parsed).header(reqwest::header::RANGE, "bytes=0-0").send().await.map_err(|error| error.to_string())?,
     };
     let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(ToString::to_string);
     let filename = filename_from_response(&response).map(|name| ensure_extension(name, content_type.as_deref().unwrap_or("")));
@@ -169,19 +212,49 @@ async fn start_download(app: tauri::AppHandle, url: String) -> Result<String, St
     let url = url.trim().to_string();
     let parsed = reqwest::Url::parse(&url).map_err(|_| "Please enter a valid URL.".to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" { return Err("Only HTTP and HTTPS downloads are supported.".to_string()); }
+
+    if is_known_media_page(&parsed) {
+        if !yt_dlp_available() {
+            return Err("YouTube/media extraction requires yt-dlp. Install yt-dlp, restart Monk3i, and try again.".to_string());
+        }
+        let id = format!("download-{}", Instant::now().elapsed().as_nanos());
+        let directory = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let template = directory.join("%(title)s.%(ext)s");
+        let _ = app.emit("download-progress", DownloadProgress { id: id.clone(), url: url.clone(), filename: "Preparing media...".to_string(), downloaded: 0, total: None, percent: Some(0.0), speed: 0, status: "downloading".to_string(), path: None, error: None });
+        let output = Command::new("yt-dlp")
+            .args(["--no-playlist", "--newline", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o"])
+            .arg(template.to_string_lossy().to_string())
+            .arg(&url)
+            .output()
+            .map_err(|error| format!("Could not start yt-dlp: {error}"))?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if message.is_empty() { "Media download failed.".to_string() } else { message };
+            let _ = app.emit("download-progress", DownloadProgress { id: id.clone(), url, filename: "Media download".to_string(), downloaded: 0, total: None, percent: None, speed: 0, status: "error".to_string(), path: None, error: Some(message.clone()) });
+            return Err(message);
+        }
+        let info = inspect_media_with_yt_dlp(&url).ok();
+        let title = info.as_ref().and_then(|value| value.title.clone()).unwrap_or_else(|| "Downloaded media".to_string());
+        let ext = info.as_ref().and_then(|value| value.ext.clone()).unwrap_or_else(|| "mp4".to_string());
+        let filename = format!("{}.{}", sanitize_filename(&title), ext);
+        let output_path = directory.join(&filename);
+        let total = info.as_ref().and_then(|value| value.filesize.or(value.filesize_approx));
+        let _ = app.emit("download-progress", DownloadProgress { id: id.clone(), url, filename, downloaded: total.unwrap_or(0), total, percent: Some(100.0), speed: 0, status: "completed".to_string(), path: Some(output_path.to_string_lossy().to_string()), error: None });
+        return Ok(id);
+    }
+
     let id = format!("download-{}", Instant::now().elapsed().as_nanos());
     let client = reqwest::Client::builder().user_agent("Monk3i Download Manager/0.1").redirect(reqwest::redirect::Policy::limited(10)).build().map_err(|error| error.to_string())?;
     let response = client.get(parsed).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
     let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("");
     let kind = resource_kind(Some(content_type), response.url());
-    if kind == "webpage" || kind == "media_page" {
-        return Err(if kind == "media_page" { "This is a media webpage. Media extraction is not enabled yet.".to_string() } else { "This URL points to a webpage, not a direct file.".to_string() });
-    }
+    if kind == "webpage" || kind == "media_page" { return Err(if kind == "media_page" { "This is a media webpage. Media extraction is not enabled yet.".to_string() } else { "This URL points to a webpage, not a direct file.".to_string() }); }
     let filename = filename_from_response(&response).map(|name| ensure_extension(name, content_type)).unwrap_or_else(|| extension_for_content_type(content_type).map(|extension| format!("download.{extension}")).unwrap_or_else(|| "download.bin".to_string()));
     let directory = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let output_path = available_path(&directory, &filename);
-    let total = response.content_length();
+    let total = total_size_from_response(&response);
     let _ = app.emit("download-progress", DownloadProgress { id: id.clone(), url: url.clone(), filename: filename.clone(), downloaded: 0, total, percent: total.map(|_| 0.0), speed: 0, status: "downloading".to_string(), path: None, error: None });
     let mut file = tokio::fs::File::create(&output_path).await.map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
