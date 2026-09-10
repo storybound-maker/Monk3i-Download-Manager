@@ -1,50 +1,114 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const addDownload = () => {
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) return;
+
+    console.log("Download requested:", trimmedUrl);
+    setUrl("");
+  };
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">M</div>
+          <div>
+            <div className="brand-name">Monk3i</div>
+            <div className="brand-subtitle">Download Manager</div>
+          </div>
+        </div>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          <button className="nav-item active" type="button">
+            <span className="nav-icon">↓</span>
+            <span>Downloads</span>
+          </button>
+          <button className="nav-item" type="button">
+            <span className="nav-icon">◷</span>
+            <span>Queue</span>
+          </button>
+          <button className="nav-item" type="button">
+            <span className="nav-icon">✓</span>
+            <span>Completed</span>
+          </button>
+          <button className="nav-item" type="button">
+            <span className="nav-icon">⚙</span>
+            <span>Settings</span>
+          </button>
+        </nav>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+        <div className="sidebar-footer">
+          <span>Monk3i Systems</span>
+          <span>v0.1.0</span>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">MONK3I SYSTEMS</p>
+            <h1>Downloads</h1>
+            <p className="page-description">
+              Manage and monitor your downloads in one place.
+            </p>
+          </div>
+
+          <button className="icon-button" type="button" aria-label="Settings">
+            ⚙
+          </button>
+        </header>
+
+        <section className="add-card" aria-label="Add download">
+          <div className="add-card-copy">
+            <div className="add-icon">↓</div>
+            <div>
+              <h2>Add a download</h2>
+              <p>Paste a direct download link to get started.</p>
+            </div>
+          </div>
+
+          <div className="url-row">
+            <input
+              className="url-input"
+              type="url"
+              value={url}
+              onChange={(event) => setUrl(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") addDownload();
+              }}
+              placeholder="https://example.com/file.zip"
+              aria-label="Download URL"
+            />
+            <button className="primary-button" type="button" onClick={addDownload}>
+              + Add Download
+            </button>
+          </div>
+        </section>
+
+        <section className="downloads-panel">
+          <div className="section-heading">
+            <div>
+              <h2>Active Downloads</h2>
+              <p>Downloads currently in progress.</p>
+            </div>
+            <span className="count-badge">0</span>
+          </div>
+
+          <div className="empty-state">
+            <div className="empty-icon">↓</div>
+            <h3>No active downloads</h3>
+            <p>
+              Your active downloads will appear here once you add a download.
+            </p>
+          </div>
+        </section>
+      </main>
+    </div>
   );
 }
 
