@@ -29,29 +29,64 @@ struct DownloadProgress {
     error: Option<String>,
 }
 
-fn filename_from_url(url: &str) -> String {
-    url.split('?')
-        .next()
-        .and_then(|value| value.rsplit('/').next())
+fn sanitize_filename(filename: &str) -> String {
+    let cleaned: String = filename
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn filename_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let segment = parsed
+        .path_segments()?
         .filter(|value| !value.is_empty())
-        .map(|value| value.chars().filter(|c| !c.is_control()).collect())
-        .filter(|value: &String| !value.is_empty())
-        .unwrap_or_else(|| "download".to_string())
+        .next_back()?;
+
+    if segment.is_empty() {
+        return None;
+    }
+
+    let decoded = percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .ok()?
+        .to_string();
+    let decoded = sanitize_filename(&decoded);
+
+    if decoded == "download" {
+        None
+    } else {
+        Some(decoded)
+    }
 }
 
 fn filename_from_content_disposition(value: &str) -> Option<String> {
     for part in value.split(';').skip(1) {
         let part = part.trim();
         if let Some(filename) = part.strip_prefix("filename*=UTF-8''") {
-            let decoded = filename.replace("%20", " ");
+            let decoded = percent_encoding::percent_decode_str(filename)
+                .decode_utf8()
+                .ok()?
+                .to_string();
             if !decoded.is_empty() {
-                return Some(decoded.trim_matches('"').to_string());
+                return Some(sanitize_filename(&decoded));
             }
         }
         if let Some(filename) = part.strip_prefix("filename=") {
             let filename = filename.trim().trim_matches('"');
             if !filename.is_empty() {
-                return Some(filename.to_string());
+                return Some(sanitize_filename(filename));
             }
         }
     }
@@ -69,16 +104,31 @@ fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
         "video/mp4" => Some("mp4"),
         "video/webm" => Some("webm"),
         "video/quicktime" => Some("mov"),
+        "video/x-matroska" => Some("mkv"),
         "audio/mpeg" => Some("mp3"),
         "audio/mp4" => Some("m4a"),
         "audio/wav" => Some("wav"),
+        "audio/ogg" => Some("ogg"),
         "application/pdf" => Some("pdf"),
         "application/zip" => Some("zip"),
         "application/gzip" => Some("gz"),
         "application/x-rar-compressed" => Some("rar"),
-        "application/octet-stream" => None,
+        "application/json" => Some("json"),
+        "text/plain" => Some("txt"),
         _ => None,
     }
+}
+
+fn ensure_extension(filename: String, content_type: &str) -> String {
+    if std::path::Path::new(&filename).extension().is_some() {
+        return filename;
+    }
+
+    if let Some(extension) = extension_for_content_type(content_type) {
+        return format!("{filename}.{extension}");
+    }
+
+    filename
 }
 
 fn resource_kind(content_type: Option<&str>, url: &reqwest::Url) -> &'static str {
@@ -142,17 +192,16 @@ fn available_path(directory: &PathBuf, filename: &str) -> PathBuf {
     directory.join(format!("download-{}.bin", Instant::now().elapsed().as_nanos()))
 }
 
-fn filename_from_response(response: &reqwest::Response) -> String {
+fn filename_from_response(response: &reqwest::Response) -> Option<String> {
     if let Some(value) = response.headers().get(reqwest::header::CONTENT_DISPOSITION) {
         if let Ok(value) = value.to_str() {
             if let Some(filename) = filename_from_content_disposition(value) {
-                return filename;
+                return Some(filename);
             }
         }
     }
 
-    let url = response.url();
-    filename_from_url(url.path())
+    filename_from_url(response.url().as_str())
 }
 
 #[tauri::command]
@@ -192,11 +241,7 @@ async fn inspect_url(url: String) -> Result<ResourceInfo, String> {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
-    let filename = if response.status().is_success() {
-        Some(filename_from_response(&response))
-    } else {
-        None
-    };
+    let filename = filename_from_response(&response).map(|name| ensure_extension(name, content_type.as_deref().unwrap_or("")));
     let size = response.content_length();
     let final_url = response.url().to_string();
     let kind = resource_kind(content_type.as_deref(), response.url()).to_string();
@@ -234,19 +279,19 @@ async fn start_download(app: tauri::AppHandle, url: String) -> Result<String, St
         .error_for_status()
         .map_err(|error| error.to_string())?;
 
-    let filename = filename_from_response(&response);
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let mut filename = filename;
 
-    if filename == "download" {
-        if let Some(extension) = extension_for_content_type(content_type) {
-            filename = format!("download.{extension}");
-        }
-    }
+    let filename = filename_from_response(&response)
+        .map(|name| ensure_extension(name, content_type))
+        .unwrap_or_else(|| {
+            extension_for_content_type(content_type)
+                .map(|extension| format!("download.{extension}"))
+                .unwrap_or_else(|| "download.bin".to_string())
+        });
 
     let directory = dirs::download_dir()
         .or_else(dirs::home_dir)
