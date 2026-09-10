@@ -131,6 +131,24 @@ fn ensure_extension(filename: String, content_type: &str) -> String {
     filename
 }
 
+fn is_known_media_page(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+
+    matches!(
+        host,
+        "youtube.com"
+            | "youtu.be"
+            | "youtube-nocookie.com"
+            | "vimeo.com"
+            | "dailymotion.com"
+            | "tiktok.com"
+            | "instagram.com"
+            | "facebook.com"
+            | "soundcloud.com"
+    )
+}
+
 fn resource_kind(content_type: Option<&str>, url: &reqwest::Url) -> &'static str {
     let mime = content_type
         .and_then(|value| value.split(';').next())
@@ -139,7 +157,7 @@ fn resource_kind(content_type: Option<&str>, url: &reqwest::Url) -> &'static str
         .to_ascii_lowercase();
 
     if mime == "text/html" || mime == "application/xhtml+xml" {
-        return "webpage";
+        return if is_known_media_page(url) { "media_page" } else { "webpage" };
     }
     if mime.starts_with("image/") {
         return "image";
@@ -269,6 +287,7 @@ async fn start_download(app: tauri::AppHandle, url: String) -> Result<String, St
     let id = format!("download-{}", Instant::now().elapsed().as_nanos());
     let client = reqwest::Client::builder()
         .user_agent("Monk3i Download Manager/0.1")
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|error| error.to_string())?;
     let response = client
@@ -284,6 +303,15 @@ async fn start_download(app: tauri::AppHandle, url: String) -> Result<String, St
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
+
+    let kind = resource_kind(Some(content_type), response.url());
+    if kind == "webpage" || kind == "media_page" {
+        return Err(if kind == "media_page" {
+            "This is a media webpage. Media extraction is not enabled yet.".to_string()
+        } else {
+            "This URL points to a webpage, not a direct file.".to_string()
+        });
+    }
 
     let filename = filename_from_response(&response)
         .map(|name| ensure_extension(name, content_type))
