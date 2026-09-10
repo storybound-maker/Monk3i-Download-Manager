@@ -1,16 +1,79 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
+
+type DownloadProgress = {
+  id: string;
+  url: string;
+  filename: string;
+  downloaded: number;
+  total: number | null;
+  percent: number | null;
+  speed: number;
+  status: "downloading" | "completed" | "error";
+  path: string | null;
+  error: string | null;
+};
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
 
 function App() {
   const [url, setUrl] = useState("");
+  const [downloads, setDownloads] = useState<DownloadProgress[]>([]);
+  const [error, setError] = useState("");
 
-  const addDownload = () => {
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<DownloadProgress>("download-progress", (event) => {
+      setDownloads((current) => {
+        const incoming = event.payload;
+        const existingIndex = current.findIndex((download) => download.id === incoming.id);
+
+        if (existingIndex === -1) {
+          return [incoming, ...current];
+        }
+
+        const next = [...current];
+        next[existingIndex] = incoming;
+        return next;
+      });
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  const addDownload = async () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) return;
 
-    console.log("Download requested:", trimmedUrl);
-    setUrl("");
+    setError("");
+
+    try {
+      await invoke("start_download", { url: trimmedUrl });
+      setUrl("");
+    } catch (downloadError) {
+      setError(String(downloadError));
+    }
   };
+
+  const activeDownloads = downloads.filter(
+    (download) => download.status === "downloading" || download.status === "error",
+  );
 
   return (
     <div className="app-shell">
@@ -88,6 +151,7 @@ function App() {
               + Add Download
             </button>
           </div>
+          {error && <p className="error-message">{error}</p>}
         </section>
 
         <section className="downloads-panel">
@@ -96,16 +160,57 @@ function App() {
               <h2>Active Downloads</h2>
               <p>Downloads currently in progress.</p>
             </div>
-            <span className="count-badge">0</span>
+            <span className="count-badge">{activeDownloads.length}</span>
           </div>
 
-          <div className="empty-state">
-            <div className="empty-icon">↓</div>
-            <h3>No active downloads</h3>
-            <p>
-              Your active downloads will appear here once you add a download.
-            </p>
-          </div>
+          {activeDownloads.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">↓</div>
+              <h3>No active downloads</h3>
+              <p>
+                Your active downloads will appear here once you add a download.
+              </p>
+            </div>
+          ) : (
+            <div className="download-list">
+              {activeDownloads.map((download) => {
+                const percent = Math.min(100, Math.max(0, download.percent ?? 0));
+
+                return (
+                  <article className="download-item" key={download.id}>
+                    <div className="download-item-top">
+                      <div className="download-file-info">
+                        <div className="download-file-icon">↓</div>
+                        <div>
+                          <h3>{download.filename}</h3>
+                          <p>
+                            {formatBytes(download.downloaded)}
+                            {download.total !== null && ` / ${formatBytes(download.total)}`}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="download-status">
+                        {download.status === "error" ? "Error" : `${percent.toFixed(0)}%`}
+                      </div>
+                    </div>
+
+                    <div className="progress-track" aria-label="Download progress">
+                      <div className="progress-fill" style={{ width: `${percent}%` }} />
+                    </div>
+
+                    <div className="download-item-bottom">
+                      <span>
+                        {download.status === "error"
+                          ? download.error ?? "Download failed."
+                          : formatSpeed(download.speed)}
+                      </span>
+                      <span>{download.status === "error" ? "" : "Downloading"}</span>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
         </section>
       </main>
     </div>
