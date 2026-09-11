@@ -1,12 +1,6 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex},
-    time::Instant,
-};
+use std::{collections::HashMap, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}, time::Instant};
 use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -26,13 +20,7 @@ fn get_control(id:&str)->Option<Arc<Control>>{controls().lock().ok()?.get(id).cl
 fn remove_control(id:&str){if let Ok(mut m)=controls().lock(){m.remove(id);}}
 fn emit(app:&tauri::AppHandle,p:DownloadProgress){let _=app.emit("download-progress",p);}
 
-fn sanitize_filename(filename:&str)->String{
-    let mut cleaned:String=filename.chars().map(|c|match c{'<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*'=>'_',c if c.is_control()=>'_',c=>c}).collect();
-    cleaned=cleaned.trim().trim_matches('.').to_string();
-    let stem=cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if matches!(stem.as_str(),"CON"|"PRN"|"AUX"|"NUL"|"COM1"|"COM2"|"COM3"|"COM4"|"COM5"|"COM6"|"COM7"|"COM8"|"COM9"|"LPT1"|"LPT2"|"LPT3"|"LPT4"|"LPT5"|"LPT6"|"LPT7"|"LPT8"|"LPT9"){cleaned.insert(0,'_');}
-    if cleaned.is_empty(){"download".into()}else{cleaned}
-}
+fn sanitize_filename(filename:&str)->String{let mut cleaned:String=filename.chars().map(|c|match c{'<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*'=>'_',c if c.is_control()=>'_',c=>c}).collect();cleaned=cleaned.trim().trim_matches('.').to_string();let stem=cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();if matches!(stem.as_str(),"CON"|"PRN"|"AUX"|"NUL"|"COM1"|"COM2"|"COM3"|"COM4"|"COM5"|"COM6"|"COM7"|"COM8"|"COM9"|"LPT1"|"LPT2"|"LPT3"|"LPT4"|"LPT5"|"LPT6"|"LPT7"|"LPT8"|"LPT9"){cleaned.insert(0,'_');}if cleaned.is_empty(){"download".into()}else{cleaned}}
 fn truncate_utf8(value:&str,max_bytes:usize)->String{if value.len()<=max_bytes{return value.to_string()}let mut end=max_bytes;while end>0&&!value.is_char_boundary(end){end-=1;}value[..end].to_string()}
 fn safe_media_filename(title:&str,extension:&str)->String{let title=sanitize_filename(title);let extension=extension.trim_start_matches('.').to_ascii_lowercase();let extension=if extension.is_empty(){"bin".to_string()}else{sanitize_filename(&extension)};let suffix=format!(".{extension}");let base_limit=100usize.saturating_sub(suffix.len()).max(1);format!("{}{}",truncate_utf8(&title,base_limit),suffix)}
 
@@ -82,7 +70,7 @@ async fn run_media(app:tauri::AppHandle,id:String,url:String,directory:PathBuf,c
             if control.cancelled.load(Ordering::Relaxed)||control.paused.load(Ordering::Relaxed){child_was_killed=true;kill_media_child(&control)}
             if out.is_none()&&err.is_none(){break}
             tokio::select!{
-                r=async{if let Some(lines)=&mut out{lines.next_line().await}else{Ok(None)}}=>match r{Ok(Some(line))=>{if let Some(p)=path_from_yt_dlp_output(&line,&temp_dir){printed_path=Some(p)}if let Some((d,t,s,p))=parse_progress(&line){emit_progress(&app,&id,&url,"Downloading media...",d,t,p,s,"downloading",None,None)}},_=async{if out.is_some(){tokio::time::sleep(std::time::Duration::from_millis(10)).await}}=>{}}
+                r=async{if let Some(lines)=&mut out{lines.next_line().await}else{Ok(None)}}=>match r{Ok(Some(line))=>{if let Some(p)=path_from_yt_dlp_output(&line,&temp_dir){printed_path=Some(p)}if let Some((d,t,s,p))=parse_progress(&line){emit_progress(&app,&id,&url,"Downloading media...",d,t,p,s,"downloading",None,None)}},_=>out=None},
                 r=async{if let Some(lines)=&mut err{lines.next_line().await}else{Ok(None)}}=>match r{Ok(Some(line))=>{if let Some((d,t,s,p))=parse_progress(&line){emit_progress(&app,&id,&url,"Downloading media...",d,t,p,s,"downloading",None,None)}else if !line.trim().is_empty()&&!line.contains("[download]"){error_text.push_str(&line);error_text.push('\n')}},_=>err=None}
             }
         }
