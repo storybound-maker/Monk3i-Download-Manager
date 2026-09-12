@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -21,6 +21,8 @@ function App(){
  const [url,setUrl]=useState("");
  const [downloads,setDownloads]=useState<DownloadProgress[]>([]);
  const [queue,setQueue]=useState<QueueItem[]>([]);
+ const [launchingCount,setLaunchingCount]=useState(0);
+ const launchingUrls=useRef<string[]>([]);
  const [history,setHistory]=useState<DownloadProgress[]>(()=>loadJson(HISTORY_KEY,[]));
  const [speedLimits,setSpeedLimits]=useState<Record<string,number>>({});
  const [defaultSpeed,setDefaultSpeed]=useState(()=>Number(localStorage.getItem(DEFAULT_SPEED_KEY)||0));
@@ -30,14 +32,15 @@ function App(){
  const [inspecting,setInspecting]=useState(false);
  const [details,setDetails]=useState<DownloadProgress|null>(null);
 
- useEffect(()=>{let off:(()=>void)|undefined;listen<DownloadProgress>("download-progress",e=>setDownloads(cur=>{const x=e.payload,i=cur.findIndex(d=>d.id===x.id);if(i<0)return[x,...cur];const prev=cur[i],next={...x};if(x.status==="downloading"&&prev.status==="downloading"){next.downloaded=Math.max(prev.downloaded,x.downloaded);if(prev.total!==null&&(x.total===null||x.total<prev.total))next.total=prev.total;if(prev.percent!==null&&(x.percent===null||x.percent<prev.percent))next.percent=x.percent}const out=[...cur];out[i]=next;return out})).then(f=>off=f);return()=>off?.()},[]);
+ useEffect(()=>{let off:(()=>void)|undefined;listen<DownloadProgress>("download-progress",e=>{const x=e.payload;const launchIndex=launchingUrls.current.indexOf(x.url);if(launchIndex>=0){launchingUrls.current.splice(launchIndex,1);setLaunchingCount(n=>Math.max(0,n-1))}setDownloads(cur=>{const i=cur.findIndex(d=>d.id===x.id);if(i<0)return[x,...cur];const prev=cur[i],next={...x};if(x.status==="downloading"&&prev.status==="downloading"){next.downloaded=Math.max(prev.downloaded,x.downloaded);if(prev.total!==null&&(x.total===null||x.total<prev.total))next.total=prev.total;if(prev.percent!==null&&(x.percent===null||x.percent<prev.percent))next.percent=x.percent}const out=[...cur];out[i]=next;return out})}).then(f=>off=f);return()=>off?.()},[]);
  useEffect(()=>{localStorage.setItem(HISTORY_KEY,JSON.stringify(history))},[history]);
  useEffect(()=>{const terminal=downloads.filter(d=>["completed","cancelled","error"].includes(d.status));if(!terminal.length)return;setHistory(h=>{const ids=new Set(h.map(x=>x.id));return [...terminal.filter(x=>!ids.has(x.id)),...h].slice(0,100)})},[downloads]);
 
  const active=useMemo(()=>downloads.filter(d=>d.status==="downloading"||d.status==="paused"||d.status==="error"),[downloads]);
  const running=downloads.filter(d=>d.status==="downloading").length;
+ const occupied=downloads.filter(d=>d.status==="downloading"||d.status==="paused").length+launchingCount;
 
- useEffect(()=>{const slots=Math.max(0,MAX_ACTIVE-running);if(slots===0||queue.length===0)return;const items=queue.slice(0,slots);setQueue(q=>q.filter(x=>!items.some(i=>i.id===x.id)));items.forEach(item=>{invoke("start_download",{url:item.url}).catch(e=>{setError(String(e));setQueue(q=>[item,...q])})})},[queue.length,running]);
+ useEffect(()=>{const slots=Math.max(0,MAX_ACTIVE-occupied);if(slots===0||queue.length===0)return;const items=queue.slice(0,slots);setQueue(q=>q.filter(x=>!items.some(i=>i.id===x.id)));launchingUrls.current.push(...items.map(i=>i.url));setLaunchingCount(n=>n+items.length);items.forEach(item=>{invoke("start_download",{url:item.url}).catch(e=>{const i=launchingUrls.current.indexOf(item.url);if(i>=0)launchingUrls.current.splice(i,1);setLaunchingCount(n=>Math.max(0,n-1));setError(String(e));setQueue(q=>q.some(x=>x.id===item.id)?q:[item,...q])})})},[queue.length,occupied]);
 
  const inspect=async()=>{const u=url.trim();if(!u)return;setError("");setInspecting(true);try{setResource(await invoke<ResourceInfo>("inspect_url",{url:u}))}catch(e){setError(String(e))}finally{setInspecting(false)}};
  const add=()=>{const u=url.trim();if(!u)return;setError("");setQueue(q=>[...q,{id:`queue-${Date.now()}-${Math.random()}`,url:u,filename:resource?.filename||u.split("/").pop()||"Queued download"}]);setUrl("");setResource(null)};
