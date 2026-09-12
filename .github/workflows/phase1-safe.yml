@@ -1,0 +1,122 @@
+name: Monk3i Phase 1 Safe Patch
+
+on:
+  push:
+    branches: [phase1-recovery-safe]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    if: "!contains(github.event.head_commit.message, '[phase1-bot]')"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase1-recovery-safe
+          fetch-depth: 0
+
+      - name: Patch stable downloader
+        shell: pwsh
+        run: |
+          @'
+          import re
+          from pathlib import Path
+
+          lib = Path('desktop/src-tauri/src/lib.rs')
+          s = lib.read_text(encoding='utf-8')
+
+          helper = r'''\
+          async fn run_direct_download(app: tauri::AppHandle, id: String, url: String, parsed: reqwest::Url, directory: PathBuf, filename: String, total_hint: Option<u64>, control: Arc<Control>) {
+              let final_path = available_path(&directory, &filename);
+              let partial_path = PathBuf::from(format!("{}.part", final_path.to_string_lossy()));
+              let mut attempt = 0u32;
+              loop {
+                  if control.cancelled.load(Ordering::Relaxed) { remove_control(&id); return; }
+                  let offset = tokio::fs::metadata(&partial_path).await.map(|m| m.len()).unwrap_or(0);
+                  let client = match reqwest::Client::builder().user_agent("Monk3i Download Manager/0.1").redirect(reqwest::redirect::Policy::limited(10)).build() {
+                      Ok(c) => c, Err(e) => { emit_progress(&app,&id,&url,&filename,offset,total_hint,None,0,"error",None,Some(e.to_string())); remove_control(&id); return; }
+                  };
+                  let mut request = client.get(parsed.clone());
+                  if offset > 0 { request = request.header(reqwest::header::RANGE, format!("bytes={offset}-")); }
+                  let response = match request.send().await {
+                      Ok(r) => r,
+                      Err(e) => { attempt += 1; if attempt < 3 { tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await; continue; } emit_progress(&app,&id,&url,&filename,offset,total_hint,None,0,"error",Some(partial_path.to_string_lossy().to_string()),Some(e.to_string())); remove_control(&id); return; }
+                  };
+                  let append = offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                  let start = if append { offset } else { 0 };
+                  if offset > 0 && !append { let _ = tokio::fs::remove_file(&partial_path).await; }
+                  if !(response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT) {
+                      attempt += 1; if attempt < 3 { tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await; continue; }
+                      emit_progress(&app,&id,&url,&filename,offset,total_hint,None,0,"error",None,Some(format!("HTTP {}",response.status()))); remove_control(&id); return;
+                  }
+                  let total = total_size_from_response(&response).or(total_hint);
+                  let mut file = if append { match tokio::fs::OpenOptions::new().create(true).append(true).open(&partial_path).await { Ok(f)=>f, Err(e)=>{attempt+=1;if attempt<3{continue}emit_progress(&app,&id,&url,&filename,start,total,None,0,"error",None,Some(e.to_string()));remove_control(&id);return;} } } else { match tokio::fs::File::create(&partial_path).await { Ok(f)=>f, Err(e)=>{emit_progress(&app,&id,&url,&filename,0,total,None,0,"error",None,Some(e.to_string()));remove_control(&id);return;} } };
+                  let mut downloaded = start;
+                  let started = Instant::now();
+                  let mut stream = response.bytes_stream();
+                  let mut failed = None;
+                  while let Some(chunk) = stream.next().await {
+                      if control.cancelled.load(Ordering::Relaxed) { drop(file); remove_control(&id); return; }
+                      if control.paused.load(Ordering::Relaxed) { emit_progress(&app,&id,&url,&filename,downloaded,total,None,0,"paused",Some(partial_path.to_string_lossy().to_string()),None); if !wait_if_paused(&control).await { drop(file); remove_control(&id); return; } }
+                      match chunk { Ok(bytes)=>{ if let Err(e)=file.write_all(&bytes).await { failed=Some(e.to_string()); break; } downloaded += bytes.len() as u64; let limit=control.speed_limit.load(Ordering::Relaxed); if limit>0 { let target=downloaded as f64/limit as f64; let elapsed=started.elapsed().as_secs_f64(); if target>elapsed {tokio::time::sleep(Duration::from_secs_f64(target-elapsed)).await;} } let speed=(downloaded as f64/started.elapsed().as_secs_f64().max(0.001)) as u64; emit_progress(&app,&id,&url,&filename,downloaded,total,total.map(|t|if t>0{downloaded as f64*100.0/t as f64}else{0.0}),speed,"downloading",Some(partial_path.to_string_lossy().to_string()),None); }, Err(e)=>{failed=Some(e.to_string());break;} }
+                  }
+                  if let Some(e)=failed { attempt+=1; if attempt<3 {tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;continue;} emit_progress(&app,&id,&url,&filename,downloaded,total,None,0,"error",Some(partial_path.to_string_lossy().to_string()),Some(e));remove_control(&id);return; }
+                  if let Err(e)=file.flush().await { attempt+=1;if attempt<3{continue}emit_progress(&app,&id,&url,&filename,downloaded,total,None,0,"error",Some(partial_path.to_string_lossy().to_string()),Some(e.to_string()));remove_control(&id);return; }
+                  let final_total=tokio::fs::metadata(&partial_path).await.map(|m|m.len()).unwrap_or(downloaded);
+                  if let Err(e)=tokio::fs::rename(&partial_path,&final_path).await { emit_progress(&app,&id,&url,&filename,final_total,total,None,0,"error",Some(partial_path.to_string_lossy().to_string()),Some(e.to_string()));remove_control(&id);return; }
+                  emit_progress(&app,&id,&url,&filename,final_total,total.or(Some(final_total)),Some(100.0),0,"completed",Some(final_path.to_string_lossy().to_string()),None);remove_control(&id);return;
+              }
+          }
+          '''
+
+          if 'async fn run_direct_download(' not in s:
+              s = s.replace('#[tauri::command]\nasync fn start_download', helper + '\n#[tauri::command]\nasync fn start_download', 1)
+
+          start = s.index('#[tauri::command]\nasync fn start_download')
+          pause = s.index('#[tauri::command]\nfn pause_download', start)
+          fn_text = s[start:pause]
+          direct_marker = 'let client=reqwest::Client::builder()'
+          direct = fn_text.index(direct_marker)
+          prefix = fn_text[:direct]
+          replacement = '''let client=reqwest::Client::builder().user_agent("Monk3i Download Manager/0.1").redirect(reqwest::redirect::Policy::limited(10)).build().map_err(|e|e.to_string())?;let response=client.head(parsed.clone()).send().await.or_else(|_|client.get(parsed.clone()).header(reqwest::header::RANGE,"bytes=0-0").send()).await.map_err(|e|e.to_string())?;let ct=response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or("").to_string();let kind=resource_kind(Some(&ct),response.url());if kind=="webpage"||kind=="media_page"{remove_control(&id);return Err("This URL points to a webpage, not a direct file.".into())}let filename=filename_from_response(&response).map(|n|ensure_extension(n,&ct)).unwrap_or_else(||extension_for_content_type(&ct).map(|e|format!("download.{e}")).unwrap_or_else(||filename_from_url(&url).unwrap_or_else(||"download.bin".into())));let d=dirs::download_dir().or_else(dirs::home_dir).ok_or_else(||"Could not find a Downloads folder.".to_string())?;std::fs::create_dir_all(&d).map_err(|e|e.to_string())?;let total=total_size_from_response(&response);emit_progress(&app,&id,&url,&filename,0,total,total.map(|_|0.0),0,"downloading",None,None);tokio::spawn(run_direct_download(app,id.clone(),url,parsed,d,filename,total,control));Ok(id)}\n'''
+          s = s[:start] + prefix + replacement + s[pause:]
+          s = s.replace('let temp_dir=directory.join(format!(".monk3i-{id}"));','let temp_dir=directory.join(format!(".monk3i-media-{}",sanitize_filename(&media_id)));',1)
+          lib.write_text(s,encoding='utf-8')
+
+          app=Path('desktop/src/App.tsx')
+          a=app.read_text(encoding='utf-8')
+          a=a.replace('const MAX_ACTIVE=3;','const MAX_ACTIVE=3;\nconst ACTIVE_KEY="monk3i-active-v2";',1)
+          a=a.replace('const [details,setDetails]=useState<DownloadProgress|null>(null);','const [details,setDetails]=useState<DownloadProgress|null>(null);\n const retryAttempts=useRef<Record<string,number>>({});',1)
+          old='if(["completed","cancelled","error"].includes(nextPayload.status)){setHistory(h=>[nextPayload,...h.filter(x=>x.id!==nextPayload.id)].slice(0,500))}}).then(f=>off=f);'
+          new='if(["completed","cancelled","error"].includes(nextPayload.status)){setHistory(h=>[nextPayload,...h.filter(x=>x.id!==nextPayload.id)].slice(0,500));if(nextPayload.status!=="error"){delete retryAttempts.current[nextPayload.url]}else{const attempt=(retryAttempts.current[nextPayload.url]||0)+1;if(attempt<=3){retryAttempts.current[nextPayload.url]=attempt;window.setTimeout(()=>setQueue(q=>q.some(x=>x.url===nextPayload.url)?q:[...q,{id:`retry-${Date.now()}-${Math.random()}`,url:nextPayload.url,filename:nextPayload.filename}]),2000*attempt)}}}}).then(f=>off=f);'
+          if old not in a: raise SystemExit('listener anchor not found')
+          a=a.replace(old,new,1)
+          hist='useEffect(()=>{localStorage.setItem(HISTORY_KEY,JSON.stringify(history))},[history]);'
+          recovery='''useEffect(()=>{try{const saved=loadJson<DownloadProgress[]>(ACTIVE_KEY,[]);if(saved.length){setQueue(q=>[...saved.map(d=>({id:`recovery-${Date.now()}-${Math.random()}`,url:d.url,filename:d.filename})),...q]);localStorage.removeItem(ACTIVE_KEY)}}catch{}},[]);\n useEffect(()=>{const unfinished=downloads.filter(d=>d.status==="downloading"||d.status==="paused");if(unfinished.length)localStorage.setItem(ACTIVE_KEY,JSON.stringify(unfinished));else localStorage.removeItem(ACTIVE_KEY)},[downloads]);'''
+          if recovery not in a:a=a.replace(hist,hist+'\n '+recovery,1)
+          app.write_text(a,encoding='utf-8')
+          print('patch complete')
+          '@ | Set-Content patch.py -Encoding UTF8
+          python patch.py
+          Remove-Item patch.py
+
+      - name: Verify Rust
+        shell: pwsh
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Verify frontend
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+
+      - name: Commit verified patch
+        shell: pwsh
+        run: |
+          git config user.name "Monk3i Phase1 Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add desktop/src-tauri/src/lib.rs desktop/src/App.tsx
+          git commit -m "Implement safe resume retry recovery [phase1-bot]"
+          git push origin phase1-recovery-safe
