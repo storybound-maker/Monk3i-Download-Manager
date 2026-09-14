@@ -388,7 +388,7 @@ fn media_expected_total(i: &YtDlpInfo) -> Option<u64> {
     let fs = i.requested_formats.as_ref()?;
     let mut n: u64 = 0;
     for f in fs {
-        n = n.saturating_add(f.filesize.or(f.filesize_approx)?)
+        n = n.saturating_add(f.filesize.or(f.filesize_approx)?);
     }
     if n > 0 {
         Some(n)
@@ -553,12 +553,13 @@ async fn run_media(
     loop {
         if c.cancelled.load(Ordering::Relaxed) {
             kill(&c);
+            let _ = tokio::fs::remove_dir_all(&td).await;
             emit_progress(
                 &app,
                 &id,
                 &url,
                 "Media download",
-                media_partial(&td).await,
+                0,
                 total,
                 None,
                 0,
@@ -591,7 +592,7 @@ async fn run_media(
                     &id,
                     &url,
                     "Media download",
-                    d,
+                    0,
                     total,
                     None,
                     0,
@@ -713,12 +714,13 @@ async fn run_media(
             None
         };
         if c.cancelled.load(Ordering::Relaxed) {
+            let _ = tokio::fs::remove_dir_all(&td).await;
             emit_progress(
                 &app,
                 &id,
                 &url,
                 "Media download",
-                last,
+                0,
                 total,
                 None,
                 0,
@@ -957,17 +959,18 @@ async fn start_download(
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
+            let _ = tokio::fs::remove_file(&part_path).await;
             emit_progress(
                 &app,
                 &id,
                 &u,
                 &filename,
-                downloaded,
+                0,
                 None,
                 None,
                 0,
                 "cancelled",
-                Some(part_path.to_string_lossy().to_string()),
+                None,
                 None,
             );
             remove_control(&id);
@@ -992,6 +995,7 @@ async fn start_download(
                 None,
             );
             if !wait_paused(&c).await {
+                let _ = tokio::fs::remove_file(&part_path).await;
                 continue;
             }
             continue;
@@ -1111,17 +1115,18 @@ async fn start_download(
         drop(file);
         drop(stream);
         if cancelled {
+            let _ = tokio::fs::remove_file(&part_path).await;
             emit_progress(
                 &app,
                 &id,
                 &u,
                 &filename,
-                downloaded,
+                0,
                 total,
-                total.map(|t| downloaded as f64 * 100.0 / t as f64),
+                None,
                 0,
                 "cancelled",
-                Some(part_path.to_string_lossy().to_string()),
+                None,
                 None,
             );
             remove_control(&id);
@@ -1142,6 +1147,7 @@ async fn start_download(
                 None,
             );
             if !wait_paused(&c).await {
+                let _ = tokio::fs::remove_file(&part_path).await;
                 continue;
             }
             continue;
