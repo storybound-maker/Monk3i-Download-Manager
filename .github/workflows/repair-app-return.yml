@@ -1,0 +1,41 @@
+name: repair App return
+
+on:
+  push:
+    branches: [phase1-reliable-http]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repair App.tsx JSX return
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("desktop/src/App.tsx")
+          s = p.read_text(encoding="utf-8")
+          old = '  return <div className="app-shell">'
+          new = '  return (\n    <div className="app-shell">'
+          if old not in s:
+              raise SystemExit("start pattern not found")
+          s = s.replace(old, new, 1)
+          old_end = '</div>}\nexport default App;'
+          new_end = '</div>\n  );\n}\n\nexport default App;'
+          if old_end not in s:
+              raise SystemExit("end pattern not found")
+          s = s.replace(old_end, new_end, 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+      - name: Commit repair and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add desktop/src/App.tsx .github/workflows/repair-app-return.yml
+          git commit -m "fix: repair App.tsx JSX return" -- desktop/src/App.tsx .github/workflows/repair-app-return.yml
+          git rm .github/workflows/repair-app-return.yml
+          git commit --amend --no-edit
+          git push
