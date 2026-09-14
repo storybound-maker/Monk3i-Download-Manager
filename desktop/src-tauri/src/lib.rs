@@ -492,9 +492,18 @@ async fn wait_paused(c: &Arc<Control>) -> bool {
     !c.cancelled.load(Ordering::Relaxed)
 }
 fn kill(c: &Arc<Control>) {
-    if let Ok(mut s) = c.child.lock() {
-        if let Some(x) = s.as_mut() {
-            let _ = x.start_kill();
+    let pid = c.child.lock().ok().and_then(|s| s.as_ref().and_then(|x| x.id()));
+    if let Some(pid) = pid {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        if let Ok(mut s) = c.child.lock() {
+            if let Some(x) = s.as_mut() {
+                let _ = x.start_kill();
+            }
         }
     }
 }
@@ -530,7 +539,7 @@ async fn run_media(
     let mid = i.id.clone().unwrap_or_else(|| id.clone());
     let title = i.title.clone().unwrap_or_else(|| "Downloaded media".into());
     let total = media_expected_total(&i);
-    let td = dir.join(format!(".monk3i-{id}"));
+    let td = std::env::temp_dir().join(format!(".monk3i-media-{id}"));
     if let Err(e) = tokio::fs::create_dir_all(&td).await {
         emit_progress(
             &app,
@@ -554,52 +563,17 @@ async fn run_media(
         if c.cancelled.load(Ordering::Relaxed) {
             kill(&c);
             let _ = tokio::fs::remove_dir_all(&td).await;
-            emit_progress(
-                &app,
-                &id,
-                &url,
-                "Media download",
-                0,
-                total,
-                None,
-                0,
-                "cancelled",
-                None,
-                None,
-            );
+            emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "cancelled", None, None);
             remove_control(&id);
             return;
         }
         if c.paused.load(Ordering::Relaxed) {
             let d = media_partial(&td).await;
-            emit_progress(
-                &app,
-                &id,
-                &url,
-                "Media download",
-                d,
-                total,
-                total.map(|t| d as f64 * 100.0 / t as f64),
-                0,
-                "paused",
-                None,
-                None,
-            );
+            emit_progress(&app, &id, &url, "Media download", d, total, total.map(|t| d as f64 * 100.0 / t as f64), 0, "paused", None, None);
             if !wait_paused(&c).await {
+                kill(&c);
                 let _ = tokio::fs::remove_dir_all(&td).await;
-                emit_progress(
-                    &app,
-                    &id,
-                    &url,
-                    "Media download",
-                    0,
-                    total,
-                    None,
-                    0,
-                    "cancelled",
-                    None,
-                    None,
-                );
+                emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "cancelled", None, None);
                 remove_control(&id);
                 return;
             }
@@ -607,161 +581,57 @@ async fn run_media(
         let mut cmd = tokio::process::Command::new("yt-dlp");
         cmd.env("PYTHONIOENCODING", "utf-8:replace")
             .env("PYTHONUTF8", "1")
-            .args([
-                "--no-playlist",
-                "--newline",
-                "--continue",
-                "-f",
-                "bv*+ba/b",
-                "--merge-output-format",
-                "mp4",
-                "--print",
-                "after_move:filepath",
-                "-o",
-            ])
+            .args(["--no-playlist", "--newline", "--continue", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
             .arg(template.to_string_lossy().to_string());
-        if let Some(p) = o.proxy.as_deref().filter(|p| !p.is_empty()) {
-            cmd.args(["--proxy", p]);
-        }
-        for x in &h {
-            cmd.args(["--add-header", x]);
-        }
+        if let Some(p) = o.proxy.as_deref().filter(|p| !p.is_empty()) { cmd.args(["--proxy", p]); }
+        for x in &h { cmd.args(["--add-header", x]); }
         let lim = c.speed_limit.load(Ordering::Relaxed);
-        if lim > 0 {
-            cmd.args(["--limit-rate", &lim.to_string()]);
-        }
-        let child = match cmd
-            .arg(&url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        if lim > 0 { cmd.args(["--limit-rate", &lim.to_string()]); }
+        let child = match cmd.arg(&url).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(v) => v,
             Err(e) => {
-                emit_progress(
-                    &app,
-                    &id,
-                    &url,
-                    "Media download",
-                    0,
-                    total,
-                    None,
-                    0,
-                    "error",
-                    None,
-                    Some(e.to_string()),
-                );
+                emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "error", None, Some(e.to_string()));
                 remove_control(&id);
                 return;
             }
         };
-        if let Ok(mut s) = c.child.lock() {
-            *s = Some(child)
-        }
+        if let Ok(mut s) = c.child.lock() { *s = Some(child) }
         let mut last = media_partial(&td).await;
         let mut last_t = Instant::now();
         let mut killed = false;
         loop {
-            if c.cancelled.load(Ordering::Relaxed) || c.paused.load(Ordering::Relaxed) {
-                killed = true;
-                kill(&c)
-            }
+            if c.cancelled.load(Ordering::Relaxed) || c.paused.load(Ordering::Relaxed) { killed = true; kill(&c) }
             tokio::time::sleep(Duration::from_millis(350)).await;
             let now = Instant::now();
             let d = media_partial(&td).await;
-            let speed = ((d.saturating_sub(last)) as f64
-                / now.duration_since(last_t).as_secs_f64().max(0.001))
-                as u64;
-            let status = if c.cancelled.load(Ordering::Relaxed) {
-                "cancelled"
-            } else if c.paused.load(Ordering::Relaxed) {
-                "paused"
-            } else {
-                "downloading"
-            };
-            emit_progress(
-                &app,
-                &id,
-                &url,
-                "Downloading media...",
-                d,
-                total,
-                total
-                    .map(|t| d as f64 * 100.0 / t as f64)
-                    .map(|p| p.min(99.9)),
-                speed,
-                status,
-                None,
-                None,
-            );
+            let speed = ((d.saturating_sub(last)) as f64 / now.duration_since(last_t).as_secs_f64().max(0.001)) as u64;
+            let status = if c.cancelled.load(Ordering::Relaxed) { "cancelled" } else if c.paused.load(Ordering::Relaxed) { "paused" } else { "downloading" };
+            emit_progress(&app, &id, &url, "Downloading media...", d, total, total.map(|t| d as f64 * 100.0 / t as f64).map(|p| p.min(99.9)), speed, status, None, None);
             last = d;
             last_t = now;
             let done = {
                 let mut s = c.child.lock().unwrap();
-                match s.as_mut() {
-                    Some(x) => matches!(x.try_wait(), Ok(Some(_)) | Err(_)),
-                    None => true,
-                }
+                match s.as_mut() { Some(x) => matches!(x.try_wait(), Ok(Some(_)) | Err(_)), None => true }
             };
-            if done {
-                break;
-            }
+            if done { break; }
         }
         let ch = { c.child.lock().unwrap().take() };
-        let status = if let Some(mut x) = ch {
-            x.wait().await.ok()
-        } else {
-            None
-        };
+        let status = if let Some(mut x) = ch { x.wait().await.ok() } else { None };
         if c.cancelled.load(Ordering::Relaxed) {
             let _ = tokio::fs::remove_dir_all(&td).await;
-            emit_progress(
-                &app,
-                &id,
-                &url,
-                "Media download",
-                0,
-                total,
-                None,
-                0,
-                "cancelled",
-                None,
-                None,
-            );
+            emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "cancelled", None, None);
             remove_control(&id);
             return;
         }
-        if c.paused.load(Ordering::Relaxed) || killed {
-            continue;
-        }
+        if c.paused.load(Ordering::Relaxed) || killed { continue; }
         if status.map(|x| x.success()).unwrap_or(false) {
             if let Some(src) = find_media(&td, &mid).await {
-                let ext = src
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .or(i.ext.as_deref())
-                    .unwrap_or("mp4");
+                let ext = src.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
                 let path = available_path(&dir, &safe_media_filename(&title, ext));
                 if tokio::fs::rename(&src, &path).await.is_ok() {
-                    let n = tokio::fs::metadata(&path)
-                        .await
-                        .map(|m| m.len())
-                        .ok()
-                        .or(total);
+                    let n = tokio::fs::metadata(&path).await.map(|m| m.len()).ok().or(total);
                     let _ = tokio::fs::remove_dir_all(&td).await;
-                    emit_progress(
-                        &app,
-                        &id,
-                        &url,
-                        path.file_name().and_then(|x| x.to_str()).unwrap_or("media"),
-                        n.unwrap_or(last),
-                        n,
-                        Some(100.),
-                        0,
-                        "completed",
-                        Some(path.to_string_lossy().to_string()),
-                        None,
-                    );
+                    emit_progress(&app, &id, &url, path.file_name().and_then(|x| x.to_str()).unwrap_or("media"), n.unwrap_or(last), n, Some(100.), 0, "completed", Some(path.to_string_lossy().to_string()), None);
                     remove_control(&id);
                     return;
                 }
@@ -773,333 +643,97 @@ async fn run_media(
             continue;
         }
         let _ = tokio::fs::remove_dir_all(&td).await;
-        emit_progress(
-            &app,
-            &id,
-            &url,
-            "Media download",
-            last,
-            total,
-            None,
-            0,
-            "error",
-            None,
-            Some("Media download failed after 3 attempts.".into()),
-        );
+        emit_progress(&app, &id, &url, "Media download", last, total, None, 0, "error", None, Some("Media download failed after 3 attempts.".into()));
         remove_control(&id);
         return;
     }
 }
 #[tauri::command]
-async fn inspect_url_with_options(
-    url: String,
-    options: Option<DownloadOptions>,
-) -> Result<ResourceInfo, String> {
+async fn inspect_url_with_options(url: String, options: Option<DownloadOptions>) -> Result<ResourceInfo, String> {
     let o = options.unwrap_or_default();
     let u = url.trim().to_string();
     let p = reqwest::Url::parse(&u).map_err(|_| "Please enter a valid URL.".to_string())?;
-    if !matches!(p.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS URLs are supported.".into());
-    }
+    if !matches!(p.scheme(), "http" | "https") { return Err("Only HTTP and HTTPS URLs are supported.".into()); }
     if is_known_media_page(&p) {
         let i = inspect_media(&u, o.headers.as_deref().unwrap_or(&[]), o.proxy.as_deref())?;
-        return Ok(ResourceInfo {
-            url: u.clone(),
-            kind: "media_page".into(),
-            content_type: None,
-            filename: i
-                .title
-                .as_ref()
-                .map(|t| safe_media_filename(t, i.ext.as_deref().unwrap_or("mp4"))),
-            size: media_expected_total(&i),
-            final_url: u,
-            status_code: 200,
-        });
+        return Ok(ResourceInfo { url: u.clone(), kind: "media_page".into(), content_type: None, filename: i.title.as_ref().map(|t| safe_media_filename(t, i.ext.as_deref().unwrap_or("mp4"))), size: media_expected_total(&i), final_url: u, status_code: 200 });
     }
     inspect_url(u).await
 }
 async fn build_http_client(o: &DownloadOptions) -> Result<reqwest::Client, String> {
-    let mut b = reqwest::Client::builder()
-        .user_agent("Monk3i Download Manager/0.2")
-        .redirect(reqwest::redirect::Policy::limited(10));
-    if let Some(p) = o.proxy.as_deref().filter(|x| !x.is_empty()) {
-        b = b.proxy(reqwest::Proxy::all(p).map_err(|e| e.to_string())?)
-    }
+    let mut b = reqwest::Client::builder().user_agent("Monk3i Download Manager/0.2").redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = o.proxy.as_deref().filter(|x| !x.is_empty()) { b = b.proxy(reqwest::Proxy::all(p).map_err(|e| e.to_string())?) }
     b.build().map_err(|e| e.to_string())
 }
-fn apply_headers(
-    mut req: reqwest::RequestBuilder,
-    headers: Option<&Vec<String>>,
-) -> reqwest::RequestBuilder {
-    if let Some(hs) = headers {
-        for x in hs {
-            if let Some((k, v)) = x.split_once(':') {
-                req = req.header(k.trim(), v.trim())
-            }
-        }
-    }
+fn apply_headers(mut req: reqwest::RequestBuilder, headers: Option<&Vec<String>>) -> reqwest::RequestBuilder {
+    if let Some(hs) = headers { for x in hs { if let Some((k, v)) = x.split_once(':') { req = req.header(k.trim(), v.trim()) } } }
     req
 }
 #[tauri::command]
-async fn start_download(
-    app: tauri::AppHandle,
-    url: String,
-    options: Option<DownloadOptions>,
-) -> Result<String, String> {
+async fn start_download(app: tauri::AppHandle, url: String, options: Option<DownloadOptions>) -> Result<String, String> {
     let u = url.trim().to_string();
     let p = reqwest::Url::parse(&u).map_err(|_| "Please enter a valid URL.".to_string())?;
-    if !matches!(p.scheme(), "http" | "https") {
-        return Err("Only HTTP and HTTPS URLs are supported.".into());
-    }
+    if !matches!(p.scheme(), "http" | "https") { return Err("Only HTTP and HTTPS URLs are supported.".into()); }
     let o = options.unwrap_or_default();
     let id = new_id();
-    let c = Arc::new(Control {
-        paused: AtomicBool::new(false),
-        cancelled: AtomicBool::new(false),
-        speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)),
-        child: Mutex::new(None),
-    });
+    let c = Arc::new(Control { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
     if is_known_media_page(&p) {
-        let d = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+        let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-        emit_progress(
-            &app,
-            &id,
-            &u,
-            "Preparing media...",
-            0,
-            None,
-            Some(0.),
-            0,
-            "downloading",
-            None,
-            None,
-        );
+        emit_progress(&app, &id, &u, "Preparing media...", 0, None, Some(0.), 0, "downloading", None, None);
         tokio::spawn(run_media(app, id.clone(), u, d, c, o));
         return Ok(id);
     }
-    let client = match build_http_client(&o).await {
-        Ok(v) => v,
-        Err(e) => {
-            remove_control(&id);
-            return Err(e);
-        }
-    };
-    let d = dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+    let client = match build_http_client(&o).await { Ok(v) => v, Err(e) => { remove_control(&id); return Err(e); } };
+    let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     let guessed = filename_from_url(&u).unwrap_or_else(|| "download.bin".into());
     let guessed_path = d.join(&guessed);
-    let mut final_path = if guessed_path
-        .with_file_name(format!(
-            "{}.part",
-            guessed_path
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or("download")
-        ))
-        .exists()
-    {
-        guessed_path
-    } else {
-        available_path(&d, &guessed)
-    };
-    let mut part_path = final_path.with_file_name(format!(
-        "{}.part",
-        final_path
-            .file_name()
-            .and_then(|x| x.to_str())
-            .unwrap_or("download")
-    ));
+    let mut final_path = if guessed_path.with_file_name(format!("{}.part", guessed_path.file_name().and_then(|x| x.to_str()).unwrap_or("download"))).exists() { guessed_path } else { available_path(&d, &guessed) };
+    let mut part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")));
     if !part_path.exists() {
-        let req = apply_headers(
-            client
-                .get(p.clone())
-                .header(reqwest::header::RANGE, "bytes=0-0"),
-            o.headers.as_ref(),
-        );
+        let req = apply_headers(client.get(p.clone()).header(reqwest::header::RANGE, "bytes=0-0"), o.headers.as_ref());
         let r = req.send().await.map_err(|e| e.to_string())?;
-        let ct = r
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if resource_kind(Some(&ct), r.url()) == "webpage"
-            || resource_kind(Some(&ct), r.url()) == "media_page"
-        {
-            remove_control(&id);
-            return Err("This URL points to a webpage, not a direct file.".into());
-        }
+        let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        if resource_kind(Some(&ct), r.url()) == "webpage" || resource_kind(Some(&ct), r.url()) == "media_page" { remove_control(&id); return Err("This URL points to a webpage, not a direct file.".into()); }
         if let Some(name) = filename_from_response(&r).map(|x| ensure_extension(x, &ct)) {
             final_path = available_path(&d, &name);
-            part_path = final_path.with_file_name(format!(
-                "{}.part",
-                final_path
-                    .file_name()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or("download")
-            ))
+            part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")))
         }
         drop(r)
     }
-    let filename = final_path
-        .file_name()
-        .and_then(|x| x.to_str())
-        .unwrap_or("download")
-        .to_string();
+    let filename = final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download").to_string();
     let mut retries = 0u8;
     loop {
         if c.cancelled.load(Ordering::Relaxed) {
-            let downloaded = tokio::fs::metadata(&part_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
             let _ = tokio::fs::remove_file(&part_path).await;
-            emit_progress(
-                &app,
-                &id,
-                &u,
-                &filename,
-                0,
-                None,
-                None,
-                0,
-                "cancelled",
-                None,
-                None,
-            );
-            remove_control(&id);
-            return Ok(id);
+            emit_progress(&app, &id, &u, &filename, 0, None, None, 0, "cancelled", None, None);
+            remove_control(&id); return Ok(id);
         }
         if c.paused.load(Ordering::Relaxed) {
-            let downloaded = tokio::fs::metadata(&part_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            emit_progress(
-                &app,
-                &id,
-                &u,
-                &filename,
-                downloaded,
-                None,
-                None,
-                0,
-                "paused",
-                Some(part_path.to_string_lossy().to_string()),
-                None,
-            );
-            if !wait_paused(&c).await {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                continue;
-            }
+            let downloaded = tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
+            emit_progress(&app, &id, &u, &filename, downloaded, None, None, 0, "paused", Some(part_path.to_string_lossy().to_string()), None);
+            if !wait_paused(&c).await { let _ = tokio::fs::remove_file(&part_path).await; continue; }
             continue;
         }
-        let existing = tokio::fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let existing = tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
         let mut req = client.get(p.clone());
-        if existing > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={existing}-"));
-        }
+        if existing > 0 { req = req.header(reqwest::header::RANGE, format!("bytes={existing}-")); }
         req = apply_headers(req, o.headers.as_ref());
         let response = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                retries = retries.saturating_add(1);
-                if retries <= 2 {
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await;
-                    continue;
-                }
-                let downloaded = tokio::fs::metadata(&part_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(existing);
-                emit_progress(
-                    &app,
-                    &id,
-                    &u,
-                    &filename,
-                    downloaded,
-                    None,
-                    None,
-                    0,
-                    "error",
-                    Some(part_path.to_string_lossy().to_string()),
-                    Some(e.to_string()),
-                );
-                remove_control(&id);
-                return Ok(id);
-            }
+            Err(e) => { retries = retries.saturating_add(1); if retries <= 2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(e.to_string())); remove_control(&id); return Ok(id); }
         };
-        if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            continue;
-        }
+        if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT { let _ = tokio::fs::remove_file(&part_path).await; continue; }
         let response = match response.error_for_status() {
             Ok(r) => r,
-            Err(e) => {
-                retries = retries.saturating_add(1);
-                if retries <= 2 {
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await;
-                    continue;
-                }
-                let downloaded = tokio::fs::metadata(&part_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(existing);
-                emit_progress(
-                    &app,
-                    &id,
-                    &u,
-                    &filename,
-                    downloaded,
-                    None,
-                    None,
-                    0,
-                    "error",
-                    Some(part_path.to_string_lossy().to_string()),
-                    Some(e.to_string()),
-                );
-                remove_control(&id);
-                return Ok(id);
-            }
+            Err(e) => { retries = retries.saturating_add(1); if retries <= 2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(e.to_string())); remove_control(&id); return Ok(id); }
         };
         let total = total_size(&response).map(|n| if existing > 0 { n.max(existing) } else { n });
         let mut downloaded = existing;
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(existing > 0)
-            .truncate(existing == 0)
-            .open(&part_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                remove_control(&id);
-                return Err(e.to_string());
-            }
-        };
-        emit_progress(
-            &app,
-            &id,
-            &u,
-            &filename,
-            downloaded,
-            total,
-            total.map(|t| downloaded as f64 * 100.0 / t as f64),
-            0,
-            "downloading",
-            Some(part_path.to_string_lossy().to_string()),
-            None,
-        );
+        let mut file = match tokio::fs::OpenOptions::new().create(true).write(true).append(existing > 0).truncate(existing == 0).open(&part_path).await { Ok(f) => f, Err(e) => { remove_control(&id); return Err(e.to_string()); } };
+        emit_progress(&app,&id,&u,&filename,downloaded,total,total.map(|t| downloaded as f64*100.0/t as f64),0,"downloading",Some(part_path.to_string_lossy().to_string()),None);
         let mut stream = response.bytes_stream();
         let started = Instant::now();
         let mut last_error: Option<String> = None;
@@ -1107,156 +741,29 @@ async fn start_download(
         let mut cancelled = false;
         loop {
             tokio::select! {
-             _=tokio::time::sleep(Duration::from_millis(200))=>{if c.cancelled.load(Ordering::Relaxed){cancelled=true;break}if c.paused.load(Ordering::Relaxed){paused=true;break}}
-             chunk=stream.next()=>match chunk{Some(Ok(bytes))=>{if c.cancelled.load(Ordering::Relaxed){cancelled=true;break}file.write_all(&bytes).await.map_err(|e|e.to_string())?;downloaded+=bytes.len() as u64;let lim=c.speed_limit.load(Ordering::Relaxed);if lim>0{let target=downloaded as f64/lim as f64;if target>started.elapsed().as_secs_f64(){tokio::time::sleep(Duration::from_secs_f64(target-started.elapsed().as_secs_f64())).await}}let speed=((downloaded.saturating_sub(existing)) as f64/started.elapsed().as_secs_f64().max(0.001)) as u64;let pct=total.map(|t|(downloaded as f64*100.0/t as f64).min(99.9));emit_progress(&app,&id,&u,&filename,downloaded,total,pct,speed,"downloading",Some(part_path.to_string_lossy().to_string()),None)}Some(Err(e))=>{last_error=Some(e.to_string());break}None=>break,}
+                _=tokio::time::sleep(Duration::from_millis(200))=>{if c.cancelled.load(Ordering::Relaxed){cancelled=true;break}if c.paused.load(Ordering::Relaxed){paused=true;break}}
+                chunk=stream.next()=>match chunk{Some(Ok(bytes))=>{if c.cancelled.load(Ordering::Relaxed){cancelled=true;break}file.write_all(&bytes).await.map_err(|e|e.to_string())?;downloaded+=bytes.len() as u64;let lim=c.speed_limit.load(Ordering::Relaxed);if lim>0{let target=downloaded as f64/lim as f64;if target>started.elapsed().as_secs_f64(){tokio::time::sleep(Duration::from_secs_f64(target-started.elapsed().as_secs_f64())).await}}let speed=((downloaded.saturating_sub(existing)) as f64/started.elapsed().as_secs_f64().max(0.001)) as u64;let pct=total.map(|t|(downloaded as f64*100.0/t as f64).min(99.9));emit_progress(&app,&id,&u,&filename,downloaded,total,pct,speed,"downloading",Some(part_path.to_string_lossy().to_string()),None)}Some(Err(e))=>{last_error=Some(e.to_string());break}None=>break,}
             }
         }
         file.flush().await.map_err(|e| e.to_string())?;
-        drop(file);
-        drop(stream);
-        if cancelled {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            emit_progress(
-                &app,
-                &id,
-                &u,
-                &filename,
-                0,
-                total,
-                None,
-                0,
-                "cancelled",
-                None,
-                None,
-            );
-            remove_control(&id);
-            return Ok(id);
-        }
-        if paused {
-            emit_progress(
-                &app,
-                &id,
-                &u,
-                &filename,
-                downloaded,
-                total,
-                total.map(|t| downloaded as f64 * 100.0 / t as f64),
-                0,
-                "paused",
-                Some(part_path.to_string_lossy().to_string()),
-                None,
-            );
-            if !wait_paused(&c).await {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                continue;
-            }
-            continue;
-        }
-        if let Some(err) = last_error {
-            retries = retries.saturating_add(1);
-            if retries <= 2 {
-                tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await;
-                continue;
-            }
-            emit_progress(
-                &app,
-                &id,
-                &u,
-                &filename,
-                downloaded,
-                total,
-                None,
-                0,
-                "error",
-                Some(part_path.to_string_lossy().to_string()),
-                Some(format!(
-                    "Download failed after automatic retries; partial file kept: {err}"
-                )),
-            );
-            remove_control(&id);
-            return Ok(id);
-        }
-        let final_total = tokio::fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(downloaded);
-        if let Some(t) = total {
-            if final_total < t {
-                retries = retries.saturating_add(1);
-                if retries <= 2 {
-                    continue;
-                }
-                emit_progress(&app,&id,&u,&filename,final_total,Some(t),Some(final_total as f64*100.0/t as f64),0,"error",Some(part_path.to_string_lossy().to_string()),Some("Server closed the connection before the expected file size was reached; partial file kept.".into()));
-                remove_control(&id);
-                return Ok(id);
-            }
-        }
-        tokio::fs::rename(&part_path, &final_path)
-            .await
-            .map_err(|e| e.to_string())?;
-        emit_progress(
-            &app,
-            &id,
-            &u,
-            &filename,
-            final_total,
-            total.or(Some(final_total)),
-            Some(100.),
-            0,
-            "completed",
-            Some(final_path.to_string_lossy().to_string()),
-            None,
-        );
-        remove_control(&id);
-        return Ok(id);
+        drop(file); drop(stream);
+        if cancelled { let _=tokio::fs::remove_file(&part_path).await; emit_progress(&app,&id,&u,&filename,0,total,None,0,"cancelled",None,None); remove_control(&id); return Ok(id); }
+        if paused { emit_progress(&app,&id,&u,&filename,downloaded,total,total.map(|t|downloaded as f64*100.0/t as f64),0,"paused",Some(part_path.to_string_lossy().to_string()),None); if !wait_paused(&c).await { let _=tokio::fs::remove_file(&part_path).await; continue; } continue; }
+        if let Some(err)=last_error { retries=retries.saturating_add(1); if retries<=2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,downloaded,total,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("Download failed after automatic retries; partial file kept: {err}"))); remove_control(&id); return Ok(id); }
+        let final_total=tokio::fs::metadata(&part_path).await.map(|m|m.len()).unwrap_or(downloaded);
+        if let Some(t)=total { if final_total<t { retries=retries.saturating_add(1); if retries<=2 {continue} emit_progress(&app,&id,&u,&filename,final_total,Some(t),Some(final_total as f64*100.0/t as f64),0,"error",Some(part_path.to_string_lossy().to_string()),Some("Server closed the connection before the expected file size was reached; partial file kept.".into())); remove_control(&id); return Ok(id); } }
+        tokio::fs::rename(&part_path,&final_path).await.map_err(|e|e.to_string())?;
+        emit_progress(&app,&id,&u,&filename,final_total,total.or(Some(final_total)),Some(100.),0,"completed",Some(final_path.to_string_lossy().to_string()),None);
+        remove_control(&id); return Ok(id);
     }
 }
 #[tauri::command]
-fn pause_download(id: String) -> Result<(), String> {
-    let c = get_control(&id).ok_or_else(|| "Download not found.".to_string())?;
-    if c.cancelled.load(Ordering::Relaxed) {
-        return Err("Download has been cancelled.".into());
-    }
-    c.paused.store(true, Ordering::Relaxed);
-    kill(&c);
-    Ok(())
-}
+fn pause_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; if c.cancelled.load(Ordering::Relaxed){return Err("Download has been cancelled.".into())} c.paused.store(true,Ordering::Relaxed); kill(&c); Ok(()) }
 #[tauri::command]
-fn resume_download(id: String) -> Result<(), String> {
-    let c = get_control(&id).ok_or_else(|| "Download not found.".to_string())?;
-    if c.cancelled.load(Ordering::Relaxed) {
-        return Err("Download has been cancelled.".into());
-    }
-    c.paused.store(false, Ordering::Relaxed);
-    Ok(())
-}
+fn resume_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; if c.cancelled.load(Ordering::Relaxed){return Err("Download has been cancelled.".into())} c.paused.store(false,Ordering::Relaxed); Ok(()) }
 #[tauri::command]
-fn cancel_download(id: String) -> Result<(), String> {
-    let c = get_control(&id).ok_or_else(|| "Download not found.".to_string())?;
-    c.cancelled.store(true, Ordering::Relaxed);
-    c.paused.store(false, Ordering::Relaxed);
-    kill(&c);
-    Ok(())
-}
+fn cancel_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.cancelled.store(true,Ordering::Relaxed); c.paused.store(false,Ordering::Relaxed); kill(&c); Ok(()) }
 #[tauri::command]
-fn set_speed_limit(id: String, bytes_per_second: u64) -> Result<(), String> {
-    let c = get_control(&id).ok_or_else(|| "Download not found.".to_string())?;
-    c.speed_limit.store(bytes_per_second, Ordering::Relaxed);
-    Ok(())
-}
+fn set_speed_limit(id: String, bytes_per_second: u64) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.speed_limit.store(bytes_per_second,Ordering::Relaxed); Ok(()) }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![
-            inspect_url,
-            inspect_url_with_options,
-            start_download,
-            pause_download,
-            resume_download,
-            cancel_download,
-            set_speed_limit
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
-}
+pub fn run() { tauri::Builder::default().plugin(tauri_plugin_opener::init()).invoke_handler(tauri::generate_handler![inspect_url,inspect_url_with_options,start_download,pause_download,resume_download,cancel_download,set_speed_limit]).run(tauri::generate_context!()).expect("error while running Tauri application"); }
