@@ -625,6 +625,32 @@ async fn run_media(
     };
     let mid = i.id.clone().unwrap_or_else(|| id.clone());
     let title = i.title.clone().unwrap_or_else(|| "Downloaded media".into());
+
+    // A completed media URL must never create a second final file. Check the
+    // canonical title-based destination before starting yt-dlp. This protects
+    // against a stale/recovered queue item launching after the original job
+    // already finished, including after an application restart.
+    let canonical_path = dir.join(safe_media_filename(&title, "mp4"));
+    if let Ok(meta) = tokio::fs::metadata(&canonical_path).await {
+        if meta.is_file() && meta.len() > 0 {
+            emit_progress(
+                &app,
+                &id,
+                &url,
+                canonical_path.file_name().and_then(|x| x.to_str()).unwrap_or("media"),
+                meta.len(),
+                Some(meta.len()),
+                Some(100.),
+                0,
+                "completed",
+                Some(canonical_path.to_string_lossy().to_string()),
+                None,
+            );
+            remove_control(&id);
+            return;
+        }
+    }
+
     let mut total = media_expected_total(&i);
     let td = std::env::temp_dir().join(format!(".monk3i-media-{id}"));
     if let Err(e) = tokio::fs::create_dir_all(&td).await {
@@ -780,7 +806,22 @@ async fn run_media(
         if status_ok || src.is_some() {
             if let Some(src) = src {
                 let ext = src.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
-                let path = available_path(&dir, &safe_media_filename(&title, ext));
+                let canonical = dir.join(safe_media_filename(&title, ext));
+                // Never turn a completed duplicate into "(1)", "(2)", etc.
+                // If another lifecycle already produced the canonical file,
+                // discard this newly produced copy and report the canonical
+                // file as the single completed result.
+                if canonical.exists() {
+                    let existing_size = tokio::fs::metadata(&canonical).await.map(|m| m.len()).unwrap_or(0);
+                    if existing_size > 0 {
+                        let _ = tokio::fs::remove_file(&src).await;
+                        let _ = tokio::fs::remove_dir_all(&td).await;
+                        emit_progress(&app, &id, &url, canonical.file_name().and_then(|x| x.to_str()).unwrap_or("media"), existing_size, Some(existing_size), Some(100.), 0, "completed", Some(canonical.to_string_lossy().to_string()), None);
+                        remove_control(&id);
+                        return;
+                    }
+                }
+                let path = canonical;
                 let mut moved = false;
                 for _ in 0..20 {
                     if tokio::fs::rename(&src, &path).await.is_ok() {
