@@ -544,7 +544,7 @@ async fn run_media(
     };
     let mid = i.id.clone().unwrap_or_else(|| id.clone());
     let title = i.title.clone().unwrap_or_else(|| "Downloaded media".into());
-    let total = media_expected_total(&i);
+    let mut total = media_expected_total(&i);
     let td = std::env::temp_dir().join(format!(".monk3i-media-{id}"));
     if let Err(e) = tokio::fs::create_dir_all(&td).await {
         emit_progress(
@@ -603,11 +603,6 @@ async fn run_media(
         }
         if c.paused.load(Ordering::Relaxed) {
             let raw_d = media_partial(&td).await;
-            if let Some(t) = total.as_ref() {
-                if raw_d > *t {
-                    total = Some(raw_d);
-                }
-            }
             if let Some(t) = total.as_ref() {
                 if raw_d > *t {
                     total = Some(raw_d);
