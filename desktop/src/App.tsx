@@ -10,7 +10,6 @@ type ResourceInfo={url:string;kind:string;content_type:string|null;filename:stri
 type QueueItem={id:string;url:string;filename:string;category:string};
 type Options={headers:string[];proxy:string;speed_limit:number};
 const HISTORY_KEY="monk3i-history-v1",OPTIONS_KEY="monk3i-network-v1",CATEGORY_KEY="monk3i-categories-v1",QUEUE_KEY="monk3i-queue-v1",ACTIVE_KEY="monk3i-active-v1",MAX_ACTIVE=3;
-const TEMP_MEDIA_NAMES=new Set(["Preparing media...","Downloading media...","Media download"]);
 function formatBytes(n:number){if(n<1024)return `${n} B`;if(n<1024**2)return `${(n/1024).toFixed(1)} KB`;if(n<1024**3)return `${(n/1024**2).toFixed(1)} MB`;return `${(n/1024**3).toFixed(2)} GB`}
 function formatSpeed(n:number){return `${formatBytes(n)}/s`}
 function load<T>(k:string,f:T):T{try{const x=localStorage.getItem(k);return x?JSON.parse(x):f}catch{return f}}
