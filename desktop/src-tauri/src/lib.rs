@@ -542,24 +542,34 @@ async fn media_partial(d: &Path) -> u64 {
     n
 }
 async fn find_media(d: &Path, id: &str) -> Option<PathBuf> {
-    // Never treat an arbitrary file in the staging directory as the finished
-    // media. A stale sidecar or intermediate file can otherwise make Monk3i
-    // believe the job completed and then launch another yt-dlp pass.
-    let mut e = tokio::fs::read_dir(d).await.ok()?;
-    while let Ok(Some(x)) = e.next_entry().await {
-        let p = x.path();
-        if !p.is_file() {
-            continue;
-        }
-        let f = p.file_name().and_then(|v| v.to_str()).unwrap_or("");
-        if f.ends_with(".part") || f.ends_with(".ytdl") {
-            continue;
-        }
-        if p.file_stem().and_then(|v| v.to_str()) == Some(id) {
-            return Some(p);
-        }
+    // Only accept the post-processed MP4. Video/audio source streams can have
+    // the same yt-dlp id and must never be mistaken for the finished download.
+    let p = d.join(format!("{id}.mp4"));
+    match tokio::fs::metadata(&p).await {
+        Ok(m) if m.is_file() && m.len() > 0 => Some(p),
+        _ => None,
     }
-    None
+}
+fn download_category(filename: &str) -> &'static str {
+    let e = Path::new(filename)
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match e.as_str() {
+        "exe" | "msi" | "msix" | "bat" | "cmd" | "ps1" | "apk" | "appimage" | "dmg" | "pkg" | "deb" | "rpm" => "Programs",
+        "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "mpeg" | "mpg" | "3gp" => "Videos",
+        "mp3" | "m4a" | "wav" | "flac" | "ogg" | "aac" | "opus" | "wma" => "Music",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "ico" => "Pictures",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv" | "rtf" | "odt" | "ods" | "odp" | "epub" => "Documents",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => "Compressed",
+        _ => "Other",
+    }
+}
+async fn category_dir(root: &Path, filename: &str) -> Result<PathBuf, String> {
+    let d = root.join(download_category(filename));
+    tokio::fs::create_dir_all(&d).await.map_err(|e| e.to_string())?;
+    Ok(d)
 }
 async fn wait_paused(c: &Arc<Control>) -> bool {
     while c.paused.load(Ordering::Relaxed) && !c.cancelled.load(Ordering::Relaxed) {
@@ -643,28 +653,10 @@ async fn run_media(
         return;
     }
     loop {
-        // A completed output may already exist if the process finished but
-        // Windows briefly held the file open during post-processing. Finalize
-        // it before ever starting another yt-dlp process.
-        if let Some(existing) = find_media(&td, &mid).await {
-            let ext = existing.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
-            let path = available_path(&dir, &safe_media_filename(&title, ext));
-            let mut moved = false;
-            for _ in 0..20 {
-                if tokio::fs::rename(&existing, &path).await.is_ok() {
-                    moved = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            if moved {
-                let n = tokio::fs::metadata(&path).await.map(|m| m.len()).ok().or(total);
-                let _ = tokio::fs::remove_dir_all(&td).await;
-                emit_progress(&app, &id, &url, path.file_name().and_then(|x| x.to_str()).unwrap_or("media"), n.unwrap_or(0), n, Some(100.), 0, "completed", Some(path.to_string_lossy().to_string()), None);
-                remove_control(&id);
-                return;
-            }
-        }
+        // Never finalize anything before yt-dlp has completed. During a
+        // video+audio download the staging directory can contain intermediate
+        // stream files with the same video id; only the post-processed MP4 is
+        // eligible for finalization.
         if c.cancelled.load(Ordering::Relaxed) {
             kill(&c);
             let _ = tokio::fs::remove_dir_all(&td).await;
@@ -692,7 +684,7 @@ async fn run_media(
         let mut cmd = tokio::process::Command::new("yt-dlp");
         cmd.env("PYTHONIOENCODING", "utf-8:replace")
             .env("PYTHONUTF8", "1")
-            .args(["--no-playlist", "--newline", "--continue", "--no-overwrites", "--retries", "3", "--fragment-retries", "3", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
+            .args(["--no-playlist", "--newline", "--continue", "--no-overwrites", "--no-keep-video", "--retries", "3", "--fragment-retries", "3", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--remux-video", "mp4", "--print", "after_move:filepath", "-o"])
             .arg(template.to_string_lossy().to_string());
         if let Some(p) = o.proxy.as_deref().filter(|p| !p.is_empty()) { cmd.args(["--proxy", p]); }
         for x in &h { cmd.args(["--add-header", x]); }
@@ -771,7 +763,7 @@ async fn run_media(
         // yt-dlp's --print after_move:filepath is the authoritative output
         // path after merging/remuxing. Never start a second media download just
         // because the final move is temporarily blocked by Windows.
-        let src = if let Some(p) = printed_path.filter(|p| p.is_file()) {
+        let src = if let Some(p) = printed_path.filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("mp4")).unwrap_or(false)) {
             Some(p)
         } else {
             find_media(&td, &mid).await
@@ -871,7 +863,8 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     controls().lock().unwrap().insert(id.clone(), c.clone());
     active_urls().lock().unwrap().insert(u.clone(), id.clone());
     if is_known_media_page(&p) {
-        let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+        let root = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+        let d = root.join("Videos");
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
         emit_progress(&app, &id, &u, "Preparing media...", 0, None, Some(0.), 0, "downloading", None, None);
         if STOP_ALL.load(Ordering::SeqCst) {
@@ -884,21 +877,38 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
         return Ok(id);
     }
     let client = match build_http_client(&o).await { Ok(v) => v, Err(e) => { remove_control(&id); return Err(e); } };
-    let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
-    std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    let root = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let guessed = filename_from_url(&u).unwrap_or_else(|| "download.bin".into());
-    let guessed_path = d.join(&guessed);
-    let mut final_path = if guessed_path.with_file_name(format!("{}.part", guessed_path.file_name().and_then(|x| x.to_str()).unwrap_or("download"))).exists() { guessed_path } else { available_path(&d, &guessed) };
-    let mut part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")));
+    let mut filename = guessed.clone();
+    let mut final_path: PathBuf;
+    let mut part_path: PathBuf;
+    {
+        let guessed_dir = category_dir(&root, &filename).await?;
+        let guessed_path = guessed_dir.join(&filename);
+        final_path = if guessed_path.with_file_name(format!("{}.part", guessed_path.file_name().and_then(|x| x.to_str()).unwrap_or("download"))).exists() {
+            guessed_path
+        } else {
+            available_path(&guessed_dir, &filename)
+        };
+        part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")));
+    }
     if !part_path.exists() {
         let req = apply_headers(client.get(p.clone()).header(reqwest::header::RANGE, "bytes=0-0"), o.headers.as_ref());
         let r = req.send().await.map_err(|e| e.to_string())?;
         let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         if resource_kind(Some(&ct), r.url()) == "webpage" || resource_kind(Some(&ct), r.url()) == "media_page" { remove_control(&id); return Err("This URL points to a webpage, not a direct file.".into()); }
         if let Some(name) = filename_from_response(&r).map(|x| ensure_extension(x, &ct)) {
-            final_path = available_path(&d, &name);
-            part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")))
+            filename = name;
         }
+        let target_dir = category_dir(&root, &filename).await?;
+        let target = target_dir.join(&filename);
+        final_path = if target.with_file_name(format!("{}.part", target.file_name().and_then(|x| x.to_str()).unwrap_or("download"))).exists() {
+            target
+        } else {
+            available_path(&target_dir, &filename)
+        };
+        part_path = final_path.with_file_name(format!("{}.part", final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download")));
         drop(r)
     }
     let filename = final_path.file_name().and_then(|x| x.to_str()).unwrap_or("download").to_string();
