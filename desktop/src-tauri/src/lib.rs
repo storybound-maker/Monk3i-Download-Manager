@@ -564,7 +564,13 @@ async fn run_media(
         return;
     }
     let template = td.join("%(id)s.%(ext)s");
-    let mut attempts = 0u8;
+    if c.cancelled.load(Ordering::Relaxed) {
+        kill(&c);
+        let _ = tokio::fs::remove_dir_all(&td).await;
+        emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "cancelled", None, None);
+        remove_control(&id);
+        return;
+    }
     loop {
         // A completed output may already exist if the process finished but
         // Windows briefly held the file open during post-processing. Finalize
@@ -597,6 +603,16 @@ async fn run_media(
         }
         if c.paused.load(Ordering::Relaxed) {
             let raw_d = media_partial(&td).await;
+            if let Some(t) = total.as_ref() {
+                if raw_d > *t {
+                    total = Some(raw_d);
+                }
+            }
+            if let Some(t) = total.as_ref() {
+                if raw_d > *t {
+                    total = Some(raw_d);
+                }
+            }
             let d = total.map(|t| raw_d.min(t)).unwrap_or(raw_d);
             emit_progress(&app, &id, &url, "Media download", d, total, total.map(|t| d as f64 * 100.0 / t as f64), 0, "paused", None, None);
             if !wait_paused(&c).await {
@@ -625,6 +641,17 @@ async fn run_media(
             }
         };
         if let Ok(mut s) = c.child.lock() { *s = Some(child) }
+        // If cancellation raced with process creation, terminate the newly
+        // spawned process immediately. This closes the small start-up window
+        // where STOP ALL could otherwise leave a fresh yt-dlp running.
+        if c.cancelled.load(Ordering::Relaxed) {
+            if let Ok(mut s) = c.child.lock() {
+                if let Some(x) = s.as_mut() {
+                    let _ = x.start_kill();
+                }
+            }
+            kill(&c);
+        }
         let mut last = media_partial(&td).await;
         let mut last_t = Instant::now();
         let mut killed = false;
@@ -722,13 +749,16 @@ async fn run_media(
             remove_control(&id);
             return;
         }
-        attempts = attempts.saturating_add(1);
-        if attempts < 3 {
-            tokio::time::sleep(Duration::from_secs(2u64.pow(attempts as u32))).await;
-            continue;
-        }
+        // yt-dlp already performs its own network/fragment retries. Do not
+        // launch a second top-level yt-dlp job here: that was the source of
+        // the repeated full-media downloads after a failed lifecycle.
+        let detail = output
+            .as_ref()
+            .map(|x| String::from_utf8_lossy(&x.stderr).trim().to_string())
+            .filter(|x| !x.is_empty())
+            .unwrap_or_else(|| "yt-dlp did not produce a completed media file.".into());
         let _ = tokio::fs::remove_dir_all(&td).await;
-        emit_progress(&app, &id, &url, "Media download", last, total, None, 0, "error", None, Some("Media download failed after 3 attempts.".into()));
+        emit_progress(&app, &id, &url, "Media download", last, total, None, 0, "error", None, Some(detail));
         remove_control(&id);
         return;
     }
