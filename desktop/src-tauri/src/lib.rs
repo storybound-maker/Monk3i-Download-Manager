@@ -376,31 +376,76 @@ fn yt_dlp_available() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
-fn inspect_media(url: &str, headers: &[String], proxy: Option<&str>) -> Result<YtDlpInfo, String> {
+async fn inspect_media(
+    url: &str,
+    headers: &[String],
+    proxy: Option<&str>,
+    control: Option<&Arc<Control>>,
+) -> Result<YtDlpInfo, String> {
     if !yt_dlp_available() {
         return Err("YouTube/media extraction requires yt-dlp.".into());
     }
-    let mut c = Command::new("yt-dlp");
-    c.env("PYTHONIOENCODING", "utf-8:replace")
+
+    let mut cmd = TokioCommand::new("yt-dlp");
+    cmd.env("PYTHONIOENCODING", "utf-8:replace")
         .env("PYTHONUTF8", "1")
-        .args(["--dump-single-json", "--no-warnings", "--no-playlist"]);
+        .args(["--dump-single-json", "--no-warnings", "--no-playlist"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
     if let Some(p) = proxy.filter(|p| !p.is_empty()) {
-        c.args(["--proxy", p]);
+        cmd.args(["--proxy", p]);
     }
     for h in headers {
-        c.args(["--add-header", h]);
+        cmd.args(["--add-header", h]);
     }
-    let o = c.arg(url).output().map_err(|e| e.to_string())?;
-    if !o.status.success() {
-        let m = String::from_utf8_lossy(&o.stderr).trim().to_string();
+
+    // Metadata extraction is a real child process. Keep the same child handle
+    // in the task Control so Cancel/STOP ALL can terminate it too. The old
+    // implementation used std::process::Command::output() inside an async
+    // task, which could occupy a Tokio worker while yt-dlp was resolving a
+    // page and make cancellation appear to hang.
+    let child = cmd.arg(url).spawn().map_err(|e| e.to_string())?;
+
+    if let Some(c) = control {
+        if let Ok(mut slot) = c.child.lock() {
+            *slot = Some(child);
+        }
+        if c.cancelled.load(Ordering::SeqCst) {
+            kill_tree(c).await;
+        }
+    }
+
+    let output = if let Some(c) = control {
+        let child = c.child.lock().ok().and_then(|mut slot| slot.take());
+        match child {
+            Some(x) => x.wait_with_output().await.map_err(|e| e.to_string())?,
+            None => return Err("Media inspection was cancelled.".into()),
+        }
+    } else {
+        child_wait_output(child).await?
+    };
+
+    if control.map(|c| c.cancelled.load(Ordering::SeqCst)).unwrap_or(false) {
+        return Err("Media inspection was cancelled.".into());
+    }
+
+    if !output.status.success() {
+        let m = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if m.is_empty() {
             "yt-dlp could not inspect this media URL.".into()
         } else {
             m
         });
     }
-    serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())
+
+    serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
 }
+
+async fn child_wait_output(mut child: tokio::process::Child) -> Result<std::process::Output, String> {
+    child.wait_with_output().await.map_err(|e| e.to_string())
+}
+
 fn media_expected_total(i: &YtDlpInfo) -> Option<u64> {
     // For YouTube's usual video+audio downloads, yt-dlp downloads multiple
     // streams and merges them. Progress must use the transfer total (the sum
@@ -429,7 +474,7 @@ async fn inspect_url(url: String) -> Result<ResourceInfo, String> {
         return Err("Only HTTP and HTTPS URLs are supported.".into());
     }
     if is_known_media_page(&p) {
-        let i = inspect_media(&u, &[], None)?;
+        let i = inspect_media(&u, &[], None, None).await?;
         return Ok(ResourceInfo {
             url: u.clone(),
             kind: "media_page".into(),
@@ -543,7 +588,7 @@ async fn run_media(
     o: DownloadOptions,
 ) {
     let h = o.headers.unwrap_or_default();
-    let i = match inspect_media(&url, &h, o.proxy.as_deref()) {
+    let i = match inspect_media(&url, &h, o.proxy.as_deref(), Some(&c)).await {
         Ok(v) => v,
         Err(e) => {
             emit_progress(
@@ -786,7 +831,7 @@ async fn inspect_url_with_options(url: String, options: Option<DownloadOptions>)
     let p = reqwest::Url::parse(&u).map_err(|_| "Please enter a valid URL.".to_string())?;
     if !matches!(p.scheme(), "http" | "https") { return Err("Only HTTP and HTTPS URLs are supported.".into()); }
     if is_known_media_page(&p) {
-        let i = inspect_media(&u, o.headers.as_deref().unwrap_or(&[]), o.proxy.as_deref())?;
+        let i = inspect_media(&u, o.headers.as_deref().unwrap_or(&[]), o.proxy.as_deref(), None).await?;
         return Ok(ResourceInfo { url: u.clone(), kind: "media_page".into(), content_type: None, filename: i.title.as_ref().map(|t| safe_media_filename(t, i.ext.as_deref().unwrap_or("mp4"))), size: media_expected_total(&i), final_url: u, status_code: 200 });
     }
     inspect_url(u).await
