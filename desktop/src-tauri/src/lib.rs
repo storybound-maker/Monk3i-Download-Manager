@@ -65,8 +65,20 @@ struct Control {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CONTROLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Control>>>> =
     std::sync::OnceLock::new();
+static STOP_ALL: AtomicBool = AtomicBool::new(false);
 fn controls() -> &'static Mutex<HashMap<String, Arc<Control>>> {
     CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn stop_all_active() {
+    let targets: Vec<Arc<Control>> = controls()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    for c in targets {
+        c.cancelled.store(true, Ordering::Relaxed);
+        c.paused.store(false, Ordering::Relaxed);
+        kill(&c);
+    }
 }
 fn new_id() -> String {
     format!("download-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -786,13 +798,21 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     if !matches!(p.scheme(), "http" | "https") { return Err("Only HTTP and HTTPS URLs are supported.".into()); }
     let o = options.unwrap_or_default();
     let id = new_id();
+    // Starting a new explicit download releases the backend STOP ALL latch.
+    STOP_ALL.store(false, Ordering::SeqCst);
     let c = Arc::new(Control { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
     if is_known_media_page(&p) {
         let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
         emit_progress(&app, &id, &u, "Preparing media...", 0, None, Some(0.), 0, "downloading", None, None);
-        tokio::spawn(run_media(app, id.clone(), u, d, c, o));
+        if STOP_ALL.load(Ordering::SeqCst) {
+        c.cancelled.store(true, Ordering::Relaxed);
+        remove_control(&id);
+        emit_progress(&app, &id, &u, "Media download", 0, None, None, 0, "cancelled", None, None);
+        return Ok(id);
+    }
+    tokio::spawn(run_media(app, id.clone(), u, d, c, o));
         return Ok(id);
     }
     let client = match build_http_client(&o).await { Ok(v) => v, Err(e) => { remove_control(&id); return Err(e); } };
@@ -873,6 +893,12 @@ fn pause_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_
 fn resume_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; if c.cancelled.load(Ordering::Relaxed){return Err("Download has been cancelled.".into())} c.paused.store(false,Ordering::Relaxed); Ok(()) }
 #[tauri::command]
 fn cancel_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.cancelled.store(true,Ordering::Relaxed); c.paused.store(false,Ordering::Relaxed); kill(&c); Ok(()) }
+#[tauri::command]
+fn cancel_all_downloads() -> Result<(), String> {
+    STOP_ALL.store(true, Ordering::SeqCst);
+    stop_all_active();
+    Ok(())
+}
 #[tauri::command]
 fn set_speed_limit(id: String, bytes_per_second: u64) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.speed_limit.store(bytes_per_second,Ordering::Relaxed); Ok(()) }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
