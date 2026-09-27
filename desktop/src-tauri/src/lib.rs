@@ -370,10 +370,11 @@ fn filename_from_response(r: &reqwest::Response) -> Option<String> {
         .and_then(filename_from_content_disposition)
         .or_else(|| filename_from_url(r.url().as_str()))
 }
-fn yt_dlp_available() -> bool {
-    Command::new("yt-dlp")
+async fn yt_dlp_available() -> bool {
+    TokioCommand::new("yt-dlp")
         .arg("--version")
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -383,7 +384,7 @@ async fn inspect_media(
     proxy: Option<&str>,
     control: Option<&Arc<Control>>,
 ) -> Result<YtDlpInfo, String> {
-    if !yt_dlp_available() {
+    if !yt_dlp_available().await {
         return Err("YouTube/media extraction requires yt-dlp.".into());
     }
 
@@ -420,9 +421,9 @@ async fn inspect_media(
         let child = c.child.lock().ok().and_then(|mut slot| slot.take());
         match child {
             Some(x) => {
-                let out = x.wait_with_output().await.map_err(|e| e.to_string())?;
+                let out = x.wait_with_output().await.map_err(|e| e.to_string());
                 c.child_pid.store(0, Ordering::SeqCst);
-                out
+                out.map_err(|e| e.to_string())?
             }
             None => return Err("Media inspection was cancelled.".into()),
         }
