@@ -382,19 +382,24 @@ fn inspect_media(url: &str, headers: &[String], proxy: Option<&str>) -> Result<Y
     serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())
 }
 fn media_expected_total(i: &YtDlpInfo) -> Option<u64> {
-    if let Some(n) = i.filesize.or(i.filesize_approx) {
-        return Some(n);
+    // For YouTube's usual video+audio downloads, yt-dlp downloads multiple
+    // streams and merges them. Progress must use the transfer total (the sum
+    // of the selected streams), not the final merged file size, otherwise the
+    // UI can legitimately pass 100% while yt-dlp is still downloading.
+    if let Some(fs) = i.requested_formats.as_ref() {
+        let mut n: u64 = 0;
+        let mut known = false;
+        for f in fs {
+            if let Some(size) = f.filesize.or(f.filesize_approx) {
+                n = n.saturating_add(size);
+                known = true;
+            }
+        }
+        if known && n > 0 {
+            return Some(n);
+        }
     }
-    let fs = i.requested_formats.as_ref()?;
-    let mut n: u64 = 0;
-    for f in fs {
-        n = n.saturating_add(f.filesize.or(f.filesize_approx)?);
-    }
-    if n > 0 {
-        Some(n)
-    } else {
-        None
-    }
+    i.filesize.or(i.filesize_approx)
 }
 #[tauri::command]
 async fn inspect_url(url: String) -> Result<ResourceInfo, String> {
@@ -467,8 +472,10 @@ async fn media_partial(d: &Path) -> u64 {
     n
 }
 async fn find_media(d: &Path, id: &str) -> Option<PathBuf> {
+    // Never treat an arbitrary file in the staging directory as the finished
+    // media. A stale sidecar or intermediate file can otherwise make Monk3i
+    // believe the job completed and then launch another yt-dlp pass.
     let mut e = tokio::fs::read_dir(d).await.ok()?;
-    let mut fallback = None;
     while let Ok(Some(x)) = e.next_entry().await {
         let p = x.path();
         if !p.is_file() {
@@ -481,9 +488,8 @@ async fn find_media(d: &Path, id: &str) -> Option<PathBuf> {
         if p.file_stem().and_then(|v| v.to_str()) == Some(id) {
             return Some(p);
         }
-        fallback = Some(p)
     }
-    fallback
+    None
 }
 async fn wait_paused(c: &Arc<Control>) -> bool {
     while c.paused.load(Ordering::Relaxed) && !c.cancelled.load(Ordering::Relaxed) {
@@ -560,6 +566,28 @@ async fn run_media(
     let template = td.join("%(id)s.%(ext)s");
     let mut attempts = 0u8;
     loop {
+        // A completed output may already exist if the process finished but
+        // Windows briefly held the file open during post-processing. Finalize
+        // it before ever starting another yt-dlp process.
+        if let Some(existing) = find_media(&td, &mid).await {
+            let ext = existing.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
+            let path = available_path(&dir, &safe_media_filename(&title, ext));
+            let mut moved = false;
+            for _ in 0..20 {
+                if tokio::fs::rename(&existing, &path).await.is_ok() {
+                    moved = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if moved {
+                let n = tokio::fs::metadata(&path).await.map(|m| m.len()).ok().or(total);
+                let _ = tokio::fs::remove_dir_all(&td).await;
+                emit_progress(&app, &id, &url, path.file_name().and_then(|x| x.to_str()).unwrap_or("media"), n.unwrap_or(0), n, Some(100.), 0, "completed", Some(path.to_string_lossy().to_string()), None);
+                remove_control(&id);
+                return;
+            }
+        }
         if c.cancelled.load(Ordering::Relaxed) {
             kill(&c);
             let _ = tokio::fs::remove_dir_all(&td).await;
@@ -581,7 +609,7 @@ async fn run_media(
         let mut cmd = tokio::process::Command::new("yt-dlp");
         cmd.env("PYTHONIOENCODING", "utf-8:replace")
             .env("PYTHONUTF8", "1")
-            .args(["--no-playlist", "--newline", "--continue", "--retries", "3", "--fragment-retries", "3", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
+            .args(["--no-playlist", "--newline", "--continue", "--no-overwrites", "--retries", "3", "--fragment-retries", "3", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
             .arg(template.to_string_lossy().to_string());
         if let Some(p) = o.proxy.as_deref().filter(|p| !p.is_empty()) { cmd.args(["--proxy", p]); }
         for x in &h { cmd.args(["--add-header", x]); }
@@ -603,8 +631,12 @@ async fn run_media(
             if c.cancelled.load(Ordering::Relaxed) || c.paused.load(Ordering::Relaxed) { killed = true; kill(&c) }
             tokio::time::sleep(Duration::from_millis(350)).await;
             let now = Instant::now();
-            let d = media_partial(&td).await;
-            let speed = ((d.saturating_sub(last)) as f64 / now.duration_since(last_t).as_secs_f64().max(0.001)) as u64;
+            let raw_d = media_partial(&td).await;
+            // Clamp only the displayed progress. The filesystem byte count is
+            // still used for speed, while the transfer total accounts for
+            // separate video/audio streams.
+            let d = total.map(|t| raw_d.min(t)).unwrap_or(raw_d);
+            let speed = ((raw_d.saturating_sub(last)) as f64 / now.duration_since(last_t).as_secs_f64().max(0.001)) as u64;
             let status = if c.cancelled.load(Ordering::Relaxed) { "cancelled" } else if c.paused.load(Ordering::Relaxed) { "paused" } else { "downloading" };
             emit_progress(&app, &id, &url, "Downloading media...", d, total, total.map(|t| d as f64 * 100.0 / t as f64).map(|p| p.min(99.9)), speed, status, None, None);
             last = d;
@@ -644,27 +676,56 @@ async fn run_media(
         }
         if c.paused.load(Ordering::Relaxed) || killed { continue; }
 
-        // yt-dlp can finish the actual download successfully and only return
-        // a non-zero status during a post-processing/printing edge case. If a
-        // real output file exists, treat the media job as complete instead of
-        // starting the entire YouTube download again.
+        // yt-dlp's --print after_move:filepath is the authoritative output
+        // path after merging/remuxing. Never start a second media download just
+        // because the final move is temporarily blocked by Windows.
         let src = if let Some(p) = printed_path.filter(|p| p.is_file()) {
             Some(p)
         } else {
             find_media(&td, &mid).await
         };
+
         if status_ok || src.is_some() {
             if let Some(src) = src {
                 let ext = src.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
                 let path = available_path(&dir, &safe_media_filename(&title, ext));
-                if tokio::fs::rename(&src, &path).await.is_ok() {
+                let mut moved = false;
+                for _ in 0..20 {
+                    if tokio::fs::rename(&src, &path).await.is_ok() {
+                        moved = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                if !moved {
+                    // Same-filesystem rename can be temporarily blocked by
+                    // Defender/indexing. Copy the already completed output
+                    // rather than downloading the media again.
+                    if tokio::fs::copy(&src, &path).await.is_ok() {
+                        let _ = tokio::fs::remove_file(&src).await;
+                        moved = true;
+                    }
+                }
+                if moved {
                     let n = tokio::fs::metadata(&path).await.map(|m| m.len()).ok().or(total);
                     let _ = tokio::fs::remove_dir_all(&td).await;
-                    emit_progress(&app, &id, &url, path.file_name().and_then(|x| x.to_str()).unwrap_or("media"), n.unwrap_or(last), n, Some(100.), 0, "completed", Some(path.to_string_lossy().to_string()), None);
+                    emit_progress(&app, &id, &url, path.file_name().and_then(|x| x.to_str()).unwrap_or("media"), n.unwrap_or(0), n, Some(100.), 0, "completed", Some(path.to_string_lossy().to_string()), None);
                     remove_control(&id);
                     return;
                 }
+
+                let _ = tokio::fs::remove_dir_all(&td).await;
+                emit_progress(&app, &id, &url, "Media download", last, total, None, 0, "error", None, Some("The media finished downloading, but Windows would not release the completed file.".into()));
+                remove_control(&id);
+                return;
             }
+
+            // yt-dlp reported success but did not leave a final output file.
+            // Do not blindly download the whole media again.
+            let _ = tokio::fs::remove_dir_all(&td).await;
+            emit_progress(&app, &id, &url, "Media download", last, total, None, 0, "error", None, Some("yt-dlp finished without producing a final media file.".into()));
+            remove_control(&id);
+            return;
         }
         attempts = attempts.saturating_add(1);
         if attempts < 3 {
