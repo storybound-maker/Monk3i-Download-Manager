@@ -705,6 +705,7 @@ async fn run_media(
                 return;
             }
         };
+        c.child_pid.store(child.id().unwrap_or(0) as u64, Ordering::SeqCst);
         if let Ok(mut s) = c.child.lock() { *s = Some(child) }
         // If cancellation raced with process creation, terminate the newly
         // spawned process immediately. This closes the small start-up window
@@ -747,8 +748,11 @@ async fn run_media(
         // must never be terminated accidentally. Cancellation/pause already
         // terminate the full process tree through kill().
         let output = if let Some(x) = ch {
-            x.wait_with_output().await.ok()
+            let out = x.wait_with_output().await.ok();
+            c.child_pid.store(0, Ordering::SeqCst);
+            out
         } else {
+            c.child_pid.store(0, Ordering::SeqCst);
             None
         };
         let status_ok = output.as_ref().map(|x| x.status.success()).unwrap_or(false);
