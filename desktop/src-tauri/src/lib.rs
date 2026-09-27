@@ -763,7 +763,15 @@ async fn run_media(
         // yt-dlp's --print after_move:filepath is the authoritative output
         // path after merging/remuxing. Never start a second media download just
         // because the final move is temporarily blocked by Windows.
-        let src = if let Some(p) = printed_path.filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("mp4")).unwrap_or(false)) {
+        // Only the exact merged/remuxed output is allowed to leave staging.
+        // yt-dlp can print other .mp4 paths for source video streams, such as
+        // <id>.f616.mp4. Those are intermediates and must never become a
+        // second download in the user's Videos folder.
+        let final_name = format!("{mid}.mp4");
+        let src = if let Some(p) = printed_path.filter(|p| {
+            p.is_file()
+                && p.file_name().and_then(|x| x.to_str()) == Some(final_name.as_str())
+        }) {
             Some(p)
         } else {
             find_media(&td, &mid).await
