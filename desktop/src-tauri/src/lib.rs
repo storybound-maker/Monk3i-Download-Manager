@@ -12,6 +12,7 @@ use std::{
 };
 use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command as TokioCommand;
 
 #[derive(Clone, Serialize)]
 struct ResourceInfo {
@@ -74,16 +75,13 @@ fn active_urls() -> &'static Mutex<HashMap<String, String>> {
 fn controls() -> &'static Mutex<HashMap<String, Arc<Control>>> {
     CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn stop_all_active() {
-    let targets: Vec<Arc<Control>> = controls()
-        .lock()
-        .map(|m| m.values().cloned().collect())
-        .unwrap_or_default();
-    for c in targets {
-        c.cancelled.store(true, Ordering::Relaxed);
-        c.paused.store(false, Ordering::Relaxed);
-        kill(&c);
+async fn stop_all_active() {
+    let targets: Vec<Arc<Control>> = controls().lock().map(|m| m.values().cloned().collect()).unwrap_or_default();
+    for c in &targets {
+        c.cancelled.store(true, Ordering::SeqCst);
+        c.paused.store(false, Ordering::SeqCst);
     }
+    futures_util::future::join_all(targets.iter().map(kill_tree)).await;
 }
 fn new_id() -> String {
     format!("download-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
@@ -520,20 +518,21 @@ async fn wait_paused(c: &Arc<Control>) -> bool {
     !c.cancelled.load(Ordering::Relaxed)
 }
 fn kill(c: &Arc<Control>) {
+    if let Ok(mut s) = c.child.lock() {
+        if let Some(x) = s.as_mut() {
+            let _ = x.start_kill();
+        }
+    }
+}
+async fn kill_tree(c: &Arc<Control>) {
     let pid = c.child.lock().ok().and_then(|s| s.as_ref().and_then(|x| x.id()));
     if let Some(pid) = pid {
         #[cfg(windows)]
         {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output();
-        }
-        if let Ok(mut s) = c.child.lock() {
-            if let Some(x) = s.as_mut() {
-                let _ = x.start_kill();
-            }
+            let _ = TokioCommand::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output().await;
         }
     }
+    kill(c);
 }
 async fn run_media(
     app: tauri::AppHandle,
@@ -673,7 +672,7 @@ async fn run_media(
         let mut last_t = Instant::now();
         let mut killed = false;
         loop {
-            if c.cancelled.load(Ordering::Relaxed) || c.paused.load(Ordering::Relaxed) { killed = true; kill(&c) }
+            if c.cancelled.load(Ordering::SeqCst) || c.paused.load(Ordering::SeqCst) { killed = true; kill_tree(&c).await; }
             tokio::time::sleep(Duration::from_millis(350)).await;
             let now = Instant::now();
             let raw_d = media_partial(&td).await;
@@ -903,15 +902,27 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     }
 }
 #[tauri::command]
-fn pause_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; if c.cancelled.load(Ordering::Relaxed){return Err("Download has been cancelled.".into())} c.paused.store(true,Ordering::Relaxed); kill(&c); Ok(()) }
+async fn pause_download(id: String) -> Result<(), String> {
+    let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?;
+    if c.cancelled.load(Ordering::SeqCst){return Err("Download has been cancelled.".into())}
+    c.paused.store(true,Ordering::SeqCst);
+    kill_tree(&c).await;
+    Ok(())
+}
 #[tauri::command]
 fn resume_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; if c.cancelled.load(Ordering::Relaxed){return Err("Download has been cancelled.".into())} c.paused.store(false,Ordering::Relaxed); Ok(()) }
 #[tauri::command]
-fn cancel_download(id: String) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.cancelled.store(true,Ordering::Relaxed); c.paused.store(false,Ordering::Relaxed); kill(&c); Ok(()) }
+async fn cancel_download(id: String) -> Result<(), String> {
+    let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?;
+    c.cancelled.store(true,Ordering::SeqCst);
+    c.paused.store(false,Ordering::SeqCst);
+    kill_tree(&c).await;
+    Ok(())
+}
 #[tauri::command]
-fn cancel_all_downloads() -> Result<(), String> {
+async fn cancel_all_downloads() -> Result<(), String> {
     STOP_ALL.store(true, Ordering::SeqCst);
-    stop_all_active();
+    stop_all_active().await;
     Ok(())
 }
 #[tauri::command]
