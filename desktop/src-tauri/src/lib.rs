@@ -581,13 +581,13 @@ async fn run_media(
         let mut cmd = tokio::process::Command::new("yt-dlp");
         cmd.env("PYTHONIOENCODING", "utf-8:replace")
             .env("PYTHONUTF8", "1")
-            .args(["--no-playlist", "--newline", "--continue", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
+            .args(["--no-playlist", "--newline", "--continue", "--retries", "3", "--fragment-retries", "3", "-f", "bv*+ba/b", "--merge-output-format", "mp4", "--print", "after_move:filepath", "-o"])
             .arg(template.to_string_lossy().to_string());
         if let Some(p) = o.proxy.as_deref().filter(|p| !p.is_empty()) { cmd.args(["--proxy", p]); }
         for x in &h { cmd.args(["--add-header", x]); }
         let lim = c.speed_limit.load(Ordering::Relaxed);
         if lim > 0 { cmd.args(["--limit-rate", &lim.to_string()]); }
-        let child = match cmd.arg(&url).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        let child = match cmd.arg(&url).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(v) => v,
             Err(e) => {
                 emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "error", None, Some(e.to_string()));
@@ -616,7 +616,11 @@ async fn run_media(
             if done { break; }
         }
         let ch = { c.child.lock().unwrap().take() };
-        let status = if let Some(mut x) = ch { x.wait().await.ok() } else { None };
+        let output = if let Some(x) = ch { x.wait_with_output().await.ok() } else { None };
+        let status_ok = output.as_ref().map(|x| x.status.success()).unwrap_or(false);
+        let printed_path = output
+            .as_ref()
+            .and_then(|x| String::from_utf8_lossy(&x.stdout).lines().rev().find(|l| !l.trim().is_empty()).map(|l| PathBuf::from(l.trim())));
         if c.cancelled.load(Ordering::Relaxed) {
             let _ = tokio::fs::remove_dir_all(&td).await;
             emit_progress(&app, &id, &url, "Media download", 0, total, None, 0, "cancelled", None, None);
@@ -624,8 +628,16 @@ async fn run_media(
             return;
         }
         if c.paused.load(Ordering::Relaxed) || killed { continue; }
-        if status.map(|x| x.success()).unwrap_or(false) {
-            if let Some(src) = find_media(&td, &mid).await {
+
+        // yt-dlp can finish the actual download successfully and only return
+        // a non-zero status during a post-processing/printing edge case. If a
+        // real output file exists, treat the media job as complete instead of
+        // starting the entire YouTube download again.
+        let src = printed_path
+            .filter(|p| p.is_file())
+            .or_else(|| futures_util::future::ready(find_media(&td, &mid)).now_or_never().flatten());
+        if status_ok || src.is_some() {
+            if let Some(src) = src {
                 let ext = src.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
                 let path = available_path(&dir, &safe_media_filename(&title, ext));
                 if tokio::fs::rename(&src, &path).await.is_ok() {
