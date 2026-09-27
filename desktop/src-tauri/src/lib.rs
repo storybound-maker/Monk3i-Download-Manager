@@ -863,13 +863,19 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     if STOP_ALL.load(Ordering::SeqCst) {
         return Err("Downloads are stopped. Start a new download explicitly to continue.".into());
     }
-    if active_urls().lock().ok().and_then(|m| m.get(&u).cloned()).is_some() {
-        return Err("This URL is already downloading.".into());
-    }
     let id = new_id();
     let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None), child_pid: AtomicU64::new(0) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
-    active_urls().lock().unwrap().insert(u.clone(), id.clone());
+    {
+        let mut active = active_urls()
+            .lock()
+            .map_err(|_| "Download state unavailable.".to_string())?;
+        if active.contains_key(&u) {
+            controls().lock().ok().map(|mut m| { m.remove(&id); });
+            return Err("This URL is already downloading.".into());
+        }
+        active.insert(u.clone(), id.clone());
+    }
     if is_known_media_page(&p) {
         let root = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
         let d = root.join("Videos");
