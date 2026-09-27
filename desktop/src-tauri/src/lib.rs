@@ -57,6 +57,7 @@ struct YtDlpInfo {
     requested_formats: Option<Vec<YtDlpFormatInfo>>,
 }
 struct Control {
+    url: String,
     paused: AtomicBool,
     cancelled: AtomicBool,
     speed_limit: AtomicU64,
@@ -66,6 +67,10 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CONTROLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Control>>>> =
     std::sync::OnceLock::new();
 static STOP_ALL: AtomicBool = AtomicBool::new(false);
+static ACTIVE_URLS: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+fn active_urls() -> &'static Mutex<HashMap<String, String>> {
+    ACTIVE_URLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn controls() -> &'static Mutex<HashMap<String, Arc<Control>>> {
     CONTROLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -87,8 +92,13 @@ fn get_control(id: &str) -> Option<Arc<Control>> {
     controls().lock().ok()?.get(id).cloned()
 }
 fn remove_control(id: &str) {
-    if let Ok(mut m) = controls().lock() {
-        m.remove(id);
+    let removed = controls().lock().ok().and_then(|mut m| m.remove(id));
+    if let Some(c) = removed {
+        if let Ok(mut m) = active_urls().lock() {
+            if m.get(&c.url).map(|v| v == id).unwrap_or(false) {
+                m.remove(&c.url);
+            }
+        }
     }
 }
 fn emit(app: &tauri::AppHandle, p: DownloadProgress) {
@@ -800,9 +810,13 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     if STOP_ALL.load(Ordering::SeqCst) {
         return Err("Downloads are stopped. Start a new download explicitly to continue.".into());
     }
+    if active_urls().lock().ok().and_then(|m| m.get(&u).cloned()).is_some() {
+        return Err("This URL is already downloading.".into());
+    }
     let id = new_id();
-    let c = Arc::new(Control { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
+    let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
+    active_urls().lock().unwrap().insert(u.clone(), id.clone());
     if is_known_media_page(&p) {
         let d = dirs::download_dir().or_else(dirs::home_dir).ok_or_else(|| "Could not find a Downloads folder.".to_string())?;
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
