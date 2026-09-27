@@ -617,8 +617,7 @@ async fn run_media(
         }
         let ch = { c.child.lock().unwrap().take() };
         let child_pid = ch.as_ref().and_then(|x| x.id());
-        let output = if let Some(mut x) = ch {
-            x.kill_on_drop(true);
+        let output = if let Some(x) = ch {
             x.wait_with_output().await.ok()
         } else {
             None
