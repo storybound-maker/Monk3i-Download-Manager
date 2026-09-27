@@ -596,7 +596,8 @@ async fn run_media(
             return;
         }
         if c.paused.load(Ordering::Relaxed) {
-            let d = media_partial(&td).await;
+            let raw_d = media_partial(&td).await;
+            let d = total.map(|t| raw_d.min(t)).unwrap_or(raw_d);
             emit_progress(&app, &id, &url, "Media download", d, total, total.map(|t| d as f64 * 100.0 / t as f64), 0, "paused", None, None);
             if !wait_paused(&c).await {
                 kill(&c);
@@ -648,22 +649,16 @@ async fn run_media(
             if done { break; }
         }
         let ch = { c.child.lock().unwrap().take() };
-        let child_pid = ch.as_ref().and_then(|x| x.id());
+        // yt-dlp does not return until its post-processors (including ffmpeg)
+        // have finished. Wait for that single process lifecycle instead of
+        // taskkilling a PID after it has already exited; a reused Windows PID
+        // must never be terminated accidentally. Cancellation/pause already
+        // terminate the full process tree through kill().
         let output = if let Some(x) = ch {
             x.wait_with_output().await.ok()
         } else {
             None
         };
-        // The yt-dlp process can launch ffmpeg for merging/post-processing.
-        // Make the process-tree cleanup explicit before Monk3i reports a
-        // terminal state, so a completed download cannot leave work running
-        // behind the UI.
-        #[cfg(windows)]
-        if let Some(pid) = child_pid {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output();
-        }
         let status_ok = output.as_ref().map(|x| x.status.success()).unwrap_or(false);
         let printed_path = output
             .as_ref()
