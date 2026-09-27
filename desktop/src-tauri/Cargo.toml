@@ -6,7 +6,7 @@ authors = ["Monk3i Systems"]
 edition = "2021"
 
 [lib]
-name = "monk3i_download_manager_lib"
+name = "desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
