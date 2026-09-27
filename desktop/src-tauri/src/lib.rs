@@ -797,9 +797,10 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     let p = reqwest::Url::parse(&u).map_err(|_| "Please enter a valid URL.".to_string())?;
     if !matches!(p.scheme(), "http" | "https") { return Err("Only HTTP and HTTPS URLs are supported.".into()); }
     let o = options.unwrap_or_default();
+    if STOP_ALL.load(Ordering::SeqCst) {
+        return Err("Downloads are stopped. Start a new download explicitly to continue.".into());
+    }
     let id = new_id();
-    // Starting a new explicit download releases the backend STOP ALL latch.
-    STOP_ALL.store(false, Ordering::SeqCst);
     let c = Arc::new(Control { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
     if is_known_media_page(&p) {
@@ -900,6 +901,11 @@ fn cancel_all_downloads() -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
+fn clear_stop_all() -> Result<(), String> {
+    STOP_ALL.store(false, Ordering::SeqCst);
+    Ok(())
+}
+#[tauri::command]
 fn set_speed_limit(id: String, bytes_per_second: u64) -> Result<(), String> { let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?; c.speed_limit.store(bytes_per_second,Ordering::Relaxed); Ok(()) }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() { tauri::Builder::default().plugin(tauri_plugin_opener::init()).invoke_handler(tauri::generate_handler![inspect_url,inspect_url_with_options,start_download,pause_download,resume_download,cancel_download,set_speed_limit]).run(tauri::generate_context!()).expect("error while running Tauri application"); }
+pub fn run() { tauri::Builder::default().plugin(tauri_plugin_opener::init()).invoke_handler(tauri::generate_handler![inspect_url,inspect_url_with_options,start_download,pause_download,resume_download,cancel_download,set_speed_limit,clear_stop_all,cancel_all_downloads]).run(tauri::generate_context!()).expect("error while running Tauri application"); }
