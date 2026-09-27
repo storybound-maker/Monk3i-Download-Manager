@@ -906,7 +906,8 @@ async fn pause_download(id: String) -> Result<(), String> {
     let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?;
     if c.cancelled.load(Ordering::SeqCst){return Err("Download has been cancelled.".into())}
     c.paused.store(true,Ordering::SeqCst);
-    kill_tree(&c).await;
+    let target=c.clone();
+    tokio::spawn(async move { kill_tree(&target).await; });
     Ok(())
 }
 #[tauri::command]
@@ -916,13 +917,16 @@ async fn cancel_download(id: String) -> Result<(), String> {
     let c=get_control(&id).ok_or_else(||"Download not found.".to_string())?;
     c.cancelled.store(true,Ordering::SeqCst);
     c.paused.store(false,Ordering::SeqCst);
-    kill_tree(&c).await;
+    let target=c.clone();
+    tokio::spawn(async move { kill_tree(&target).await; });
     Ok(())
 }
 #[tauri::command]
 async fn cancel_all_downloads() -> Result<(), String> {
+    // Latch STOP ALL synchronously. Any start_download call arriving after
+    // this point is rejected before it can create a Control.
     STOP_ALL.store(true, Ordering::SeqCst);
-    stop_all_active().await;
+    tokio::spawn(async { stop_all_active().await; });
     Ok(())
 }
 #[tauri::command]
