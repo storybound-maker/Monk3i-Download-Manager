@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -64,6 +65,8 @@ struct Control {
     speed_limit: AtomicU64,
     child: Mutex<Option<tokio::process::Child>>,
     child_pid: AtomicU64,
+    // OS-level URL lock shared by separate Monk3i processes/instances.
+    url_lock: Mutex<Option<File>>,
 }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CONTROLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Control>>>> =
@@ -86,6 +89,31 @@ async fn stop_all_active() {
 }
 fn new_id() -> String {
     format!("download-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+fn stable_url_hash(value: &str) -> String {
+    // Stable FNV-1a hash: deterministic across processes, with no extra crate.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in value.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+fn acquire_url_lock(url: &str) -> Result<File, String> {
+    let dir = std::env::temp_dir().join(".monk3i-url-locks");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create download lock directory: {e}"))?;
+    let path = dir.join(format!("{}.lock", stable_url_hash(url)));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| format!("Could not open download lock: {e}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err("This URL is already downloading in another Monk3i process.".into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("Could not acquire download lock: {e}")),
+    }
 }
 fn get_control(id: &str) -> Option<Arc<Control>> {
     controls().lock().ok()?.get(id).cloned()
@@ -904,8 +932,9 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
     if STOP_ALL.load(Ordering::SeqCst) {
         return Err("Downloads are stopped. Start a new download explicitly to continue.".into());
     }
+    let url_lock = acquire_url_lock(&u)?;
     let id = new_id();
-    let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None), child_pid: AtomicU64::new(0) });
+    let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None), child_pid: AtomicU64::new(0), url_lock: Mutex::new(Some(url_lock)) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
     {
         let mut active = active_urls()
