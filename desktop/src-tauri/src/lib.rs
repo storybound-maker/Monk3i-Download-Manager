@@ -633,9 +633,11 @@ async fn run_media(
         // a non-zero status during a post-processing/printing edge case. If a
         // real output file exists, treat the media job as complete instead of
         // starting the entire YouTube download again.
-        let src = printed_path
-            .filter(|p| p.is_file())
-            .or_else(|| futures_util::future::ready(find_media(&td, &mid)).now_or_never().flatten());
+        let src = if let Some(p) = printed_path.filter(|p| p.is_file()) {
+            Some(p)
+        } else {
+            find_media(&td, &mid).await
+        };
         if status_ok || src.is_some() {
             if let Some(src) = src {
                 let ext = src.extension().and_then(|x| x.to_str()).or(i.ext.as_deref()).unwrap_or("mp4");
