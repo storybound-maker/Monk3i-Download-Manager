@@ -63,6 +63,7 @@ struct Control {
     cancelled: AtomicBool,
     speed_limit: AtomicU64,
     child: Mutex<Option<tokio::process::Child>>,
+    child_pid: AtomicU64,
 }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CONTROLS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Control>>>> =
@@ -407,19 +408,22 @@ async fn inspect_media(
     // page and make cancellation appear to hang.
     let child = cmd.arg(url).spawn().map_err(|e| e.to_string())?;
 
-    if let Some(c) = control {
+    let output = if let Some(c) = control {
+        let pid = child.id().unwrap_or(0);
+        c.child_pid.store(pid as u64, Ordering::SeqCst);
         if let Ok(mut slot) = c.child.lock() {
             *slot = Some(child);
         }
         if c.cancelled.load(Ordering::SeqCst) {
             kill_tree(c).await;
         }
-    }
-
-    let output = if let Some(c) = control {
         let child = c.child.lock().ok().and_then(|mut slot| slot.take());
         match child {
-            Some(x) => x.wait_with_output().await.map_err(|e| e.to_string())?,
+            Some(x) => {
+                let out = x.wait_with_output().await.map_err(|e| e.to_string())?;
+                c.child_pid.store(0, Ordering::SeqCst);
+                out
+            }
             None => return Err("Media inspection was cancelled.".into()),
         }
     } else {
@@ -570,7 +574,7 @@ fn kill(c: &Arc<Control>) {
     }
 }
 async fn kill_tree(c: &Arc<Control>) {
-    let pid = c.child.lock().ok().and_then(|s| s.as_ref().and_then(|x| x.id()));
+    let pid = c.child.lock().ok().and_then(|s| s.as_ref().and_then(|x| x.id())).or_else(|| { let p=c.child_pid.load(Ordering::SeqCst); (p>0).then_some(p as u32) });
     if let Some(pid) = pid {
         #[cfg(windows)]
         {
@@ -858,7 +862,7 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
         return Err("This URL is already downloading.".into());
     }
     let id = new_id();
-    let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None) });
+    let c = Arc::new(Control { url: u.clone(), paused: AtomicBool::new(false), cancelled: AtomicBool::new(false), speed_limit: AtomicU64::new(o.speed_limit.unwrap_or(0)), child: Mutex::new(None), child_pid: AtomicU64::new(0) });
     controls().lock().unwrap().insert(id.clone(), c.clone());
     active_urls().lock().unwrap().insert(u.clone(), id.clone());
     if is_known_media_page(&p) {
