@@ -588,9 +588,9 @@ fn download_category(filename: &str) -> &'static str {
         "exe" | "msi" | "msix" | "bat" | "cmd" | "ps1" | "apk" | "appimage" | "dmg" | "pkg" | "deb" | "rpm" => "Programs",
         "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "mpeg" | "mpg" | "3gp" => "Videos",
         "mp3" | "m4a" | "wav" | "flac" | "ogg" | "aac" | "opus" | "wma" => "Music",
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "ico" => "Pictures",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "ico" => "Images",
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv" | "rtf" | "odt" | "ods" | "odp" | "epub" => "Documents",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => "Compressed",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => "Archives",
         _ => "Other",
     }
 }
