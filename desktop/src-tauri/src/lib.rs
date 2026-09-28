@@ -1015,12 +1015,49 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
         req = apply_headers(req, o.headers.as_ref());
         let response = match req.send().await {
             Ok(r) => r,
-            Err(e) => { retries = retries.saturating_add(1); if retries <= 2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(e.to_string())); remove_control(&id); return Ok(id); }
+            Err(e) => {
+                retries = retries.saturating_add(1);
+                if retries <= 3 {
+                    let delay = 2u64.pow(retries as u32);
+                    emit_progress(&app,&id,&u,&filename,existing,None,None,0,"downloading",Some(part_path.to_string_lossy().to_string()),Some(format!("Connection failed; retrying in {delay}s ({retries}/3): {e}")));
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    continue;
+                }
+                emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("Connection failed after 3 retries; partial file kept: {e}")));
+                remove_control(&id); return Ok(id);
+            }
         };
-        if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT { let _ = tokio::fs::remove_file(&part_path).await; continue; }
-        let response = match response.error_for_status() {
-            Ok(r) => r,
-            Err(e) => { retries = retries.saturating_add(1); if retries <= 2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(e.to_string())); remove_control(&id); return Ok(id); }
+        if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                retries = 0;
+                continue;
+            }
+            let _ = tokio::fs::remove_file(&part_path).await;
+            retries = 0;
+            continue;
+        }
+        let response = if response.status().is_success() {
+            response
+        } else {
+            let status = response.status();
+            let retryable = status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error();
+            if retryable {
+                retries = retries.saturating_add(1);
+                if retries <= 3 {
+                    let delay = 2u64.pow(retries as u32);
+                    let reason = format!("HTTP {status}");
+                    emit_progress(&app,&id,&u,&filename,existing,None,None,0,"downloading",Some(part_path.to_string_lossy().to_string()),Some(format!("{reason}; retrying in {delay}s ({retries}/3)")));
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    continue;
+                }
+                emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("HTTP {status} after 3 retries; partial file kept.")));
+                remove_control(&id); return Ok(id);
+            }
+            emit_progress(&app,&id,&u,&filename,existing,None,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("Server returned HTTP {status}.")));
+            remove_control(&id); return Ok(id);
         };
         let total = total_size(&response).map(|n| if existing > 0 { n.max(existing) } else { n });
         let mut downloaded = existing;
@@ -1041,7 +1078,17 @@ async fn start_download(app: tauri::AppHandle, url: String, options: Option<Down
         drop(file); drop(stream);
         if cancelled { let _=tokio::fs::remove_file(&part_path).await; emit_progress(&app,&id,&u,&filename,0,total,None,0,"cancelled",None,None); remove_control(&id); return Ok(id); }
         if paused { emit_progress(&app,&id,&u,&filename,downloaded,total,total.map(|t|downloaded as f64*100.0/t as f64),0,"paused",Some(part_path.to_string_lossy().to_string()),None); if !wait_paused(&c).await { let _=tokio::fs::remove_file(&part_path).await; continue; } continue; }
-        if let Some(err)=last_error { retries=retries.saturating_add(1); if retries<=2 { tokio::time::sleep(Duration::from_secs(2u64.pow(retries as u32))).await; continue; } emit_progress(&app,&id,&u,&filename,downloaded,total,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("Download failed after automatic retries; partial file kept: {err}"))); remove_control(&id); return Ok(id); }
+        if let Some(err)=last_error {
+            retries = retries.saturating_add(1);
+            if retries <= 3 {
+                let delay = 2u64.pow(retries as u32);
+                emit_progress(&app,&id,&u,&filename,downloaded,total,total.map(|t|downloaded as f64*100.0/t as f64),0,"downloading",Some(part_path.to_string_lossy().to_string()),Some(format!("Connection interrupted; retrying in {delay}s ({retries}/3): {err}")));
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
+            emit_progress(&app,&id,&u,&filename,downloaded,total,None,0,"error",Some(part_path.to_string_lossy().to_string()),Some(format!("Download failed after 3 retries; partial file kept: {err}")));
+            remove_control(&id); return Ok(id);
+        }
         let final_total=tokio::fs::metadata(&part_path).await.map(|m|m.len()).unwrap_or(downloaded);
         if let Some(t)=total { if final_total<t { retries=retries.saturating_add(1); if retries<=2 {continue} emit_progress(&app,&id,&u,&filename,final_total,Some(t),Some(final_total as f64*100.0/t as f64),0,"error",Some(part_path.to_string_lossy().to_string()),Some("Server closed the connection before the expected file size was reached; partial file kept.".into())); remove_control(&id); return Ok(id); } }
         tokio::fs::rename(&part_path,&final_path).await.map_err(|e|e.to_string())?;
